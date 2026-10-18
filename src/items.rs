@@ -22,6 +22,17 @@ pub struct Item {
     pub lines: (usize, usize),
     pub fingerprint: [u8; 32],
     pub is_test: bool,
+    /// Its tokens in order (doc attributes left out): each one's line and
+    /// column (1-based, as LLVM's coverage counts them) and a short hash,
+    /// for matching a changed function's sides to its earlier version's.
+    pub tokens: Vec<Token>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Token {
+    pub line: usize,
+    pub col: usize,
+    pub hash: u32,
 }
 
 /// Every function of the crate whose root file is `root`, by key.
@@ -140,21 +151,33 @@ fn add(
     let key = if *n == 1 { base } else { format!("{base}#{n}") };
     let span = tokens.clone().into_iter().next().map(|t| t.span()).unwrap();
     let last = tokens.clone().into_iter().last().map(|t| t.span()).unwrap();
-    out.insert(
-        key.clone(),
-        Item { key, file: file.to_path_buf(), lines: (span.start().line, last.end().line), fingerprint: fingerprint(tokens), is_test: is_test_attr(attrs) },
-    );
+    out.insert(key.clone(), {
+        let mut list = Vec::new();
+        walk_tokens(tokens, &mut list);
+        let mut h = blake3::Hasher::new_derive_key(FINGERPRINT_CONTEXT);
+        for (_, bytes) in &list {
+            h.update(bytes);
+        }
+        let tokens = list
+            .iter()
+            .map(|(at, bytes)| Token { line: at.line, col: at.column + 1, hash: u32::from_le_bytes(blake3::hash(bytes).as_bytes()[..4].try_into().unwrap()) })
+            .collect();
+        Item {
+            key,
+            file: file.to_path_buf(),
+            lines: (span.start().line, last.end().line),
+            fingerprint: *h.finalize().as_bytes(),
+            is_test: is_test_attr(attrs),
+            tokens,
+        }
+    });
 }
 
-/// The fingerprint of a function's tokens, its doc attributes left out
-/// (doctests are fingerprinted apart, as tests).
-pub fn fingerprint(tokens: TokenStream) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_derive_key(FINGERPRINT_CONTEXT);
-    feed(&mut h, tokens);
-    *h.finalize().as_bytes()
-}
-
-fn feed(h: &mut blake3::Hasher, tokens: TokenStream) {
+/// A function's tokens in order, doc attributes left out (doctests are
+/// tests apart): each token's position and its canonical bytes, which the
+/// fingerprint hashes in turn. Each kind of token is tagged, and text is
+/// length-prefixed, so no two token streams feed the hash alike.
+fn walk_tokens(tokens: TokenStream, out: &mut Vec<(proc_macro2::LineColumn, Vec<u8>)>) {
     let mut iter = tokens.into_iter().peekable();
     while let Some(t) = iter.next() {
         // `#[doc = ...]` (a doc comment): `#` then a bracket group whose
@@ -171,22 +194,20 @@ fn feed(h: &mut blake3::Hasher, tokens: TokenStream) {
         }
         match t {
             TokenTree::Group(g) => {
-                h.update(&[b'(', g.delimiter() as u8]);
-                feed(h, g.stream());
-                h.update(b")");
+                out.push((g.span_open().start(), vec![b'(', g.delimiter() as u8]));
+                walk_tokens(g.stream(), out);
+                out.push((g.span_close().start(), vec![b')']));
             }
-            TokenTree::Ident(i) => text(h, b'i', &i.to_string()),
-            TokenTree::Punct(p) => {
-                h.update(&[b'p', p.as_char() as u8, matches!(p.spacing(), Spacing::Joint) as u8]);
-            }
-            TokenTree::Literal(l) => text(h, b'l', &l.to_string()),
+            TokenTree::Ident(i) => out.push((i.span().start(), text(b'i', &i.to_string()))),
+            TokenTree::Punct(p) => out.push((p.span().start(), vec![b'p', p.as_char() as u8, matches!(p.spacing(), Spacing::Joint) as u8])),
+            TokenTree::Literal(l) => out.push((l.span().start(), text(b'l', &l.to_string()))),
         }
     }
 }
 
-/// A tagged, length-prefixed string, so no two token streams feed alike.
-fn text(h: &mut blake3::Hasher, tag: u8, s: &str) {
-    h.update(&[tag]);
-    h.update(&(s.len() as u64).to_le_bytes());
-    h.update(s.as_bytes());
+fn text(tag: u8, s: &str) -> Vec<u8> {
+    let mut v = vec![tag];
+    v.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    v.extend_from_slice(s.as_bytes());
+    v
 }

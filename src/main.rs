@@ -12,7 +12,7 @@ mod items;
 mod reach;
 
 use items::Item;
-use reach::{Binary, Build};
+use reach::{Binary, Build, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -22,13 +22,14 @@ use std::time::Instant;
 /// The map's format; a map of another is refused, never read.
 const FORMAT: u32 = 1;
 
-/// The reach map of one context: every item's fingerprint and sides, and
-/// every included test's reach.
+/// The reach map of one context: every item's fingerprint, tokens and
+/// sides, and every included test's reach.
 #[derive(Serialize, Deserialize)]
 struct Map {
     format: u32,
     context: String,
-    /// Each crate's id and root file (the lib, each integration test).
+    /// Each crate's id and root file (the lib, each integration test),
+    /// relative to the package's directory.
     crates: BTreeMap<String, PathBuf>,
     items: BTreeMap<String, MapItem>,
     tests: BTreeMap<String, MapTest>,
@@ -37,8 +38,14 @@ struct Map {
 #[derive(Serialize, Deserialize, Clone)]
 struct MapItem {
     fingerprint: String,
+    /// Its tokens' short hashes, to match its sides to a later version's.
+    tokens: Vec<u32>,
     /// Its sides, by index: what a test can reach in it.
-    sides: Vec<String>,
+    sides: Vec<Side>,
+}
+
+fn map_item(it: &Item, sides: Option<&Vec<Side>>) -> MapItem {
+    MapItem { fingerprint: hex(&it.fingerprint), tokens: it.tokens.iter().map(|t| t.hash).collect(), sides: sides.cloned().unwrap_or_default() }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -139,10 +146,10 @@ fn map_path(pkg: &Package, context: &str) -> PathBuf {
 }
 
 /// Every crate's items, keyed `CRATE::path` (CRATE `lib` or `test:NAME`).
-fn all_items(crates: &BTreeMap<String, PathBuf>) -> BTreeMap<String, Item> {
+fn all_items(dir: &Path, crates: &BTreeMap<String, PathBuf>) -> BTreeMap<String, Item> {
     let mut out = BTreeMap::new();
     for (id, root) in crates {
-        for (k, mut it) in items::crate_items(root) {
+        for (k, mut it) in items::crate_items(&dir.join(root)) {
             let key = format!("{id}::{k}");
             it.key = key.clone();
             out.insert(key, it);
@@ -159,23 +166,25 @@ fn test_id(bin: &Binary, name: &str) -> String {
 /// Measure `chosen` tests (by id; all included when None): build, list,
 /// run, read. Returns the binaries' crates, every item's sides, and each
 /// measured test's reach.
+/// Measure `chosen` tests (by id; all included when None): build, list,
+/// run, read. Returns the binaries' crates, every item, every item's sides,
+/// and each measured test's reach.
 fn measure(
     o: &Options,
     pkg: &Package,
     chosen: Option<&BTreeSet<String>>,
-) -> (BTreeMap<String, PathBuf>, BTreeMap<String, Item>, BTreeMap<String, Vec<String>>, BTreeMap<String, MapTest>) {
+) -> (BTreeMap<String, PathBuf>, BTreeMap<String, Item>, BTreeMap<String, Vec<Side>>, BTreeMap<String, MapTest>) {
     let t = Instant::now();
     let build = Build { toolchain: o.toolchain.clone(), cargo_args: o.cargo_args.clone(), manifest_dir: pkg.dir.clone(), target_dir: pkg.target.join("build") };
     let bins = build.binaries();
     eprintln!("    Built {} test binaries with coverage in {:.1?}", bins.len(), t.elapsed());
-    let crates: BTreeMap<String, PathBuf> = bins.iter().map(|b| (b.id.clone(), b.root.clone())).collect();
-    let items = all_items(&crates);
+    let crates: BTreeMap<String, PathBuf> = bins.iter().map(|b| (b.id.clone(), b.root.strip_prefix(&pkg.dir).unwrap_or(&b.root).to_path_buf())).collect();
+    let items = all_items(&pkg.dir, &crates);
     let mut tests = Vec::new();
     for b in &bins {
-        for name in reach::list_tests(b) {
+        for name in reach::list_tests(b, &pkg.target) {
             let id = test_id(b, &name);
-            let excluded = pkg.exclude.iter().any(|p| glob(p, &name));
-            if !excluded && chosen.is_none_or(|c| c.contains(&id)) {
+            if !excluded(pkg, &id) && chosen.is_none_or(|c| c.contains(&id)) {
                 tests.push((b.clone(), name));
             }
         }
@@ -192,6 +201,12 @@ fn measure(
     }
     eprintln!("    Measured {} tests in {:.1?}", tests.len(), t.elapsed());
     (crates, items, sides, reached)
+}
+
+/// Whether a test (by id) is one `exclude` names: by libtest's name.
+fn excluded(pkg: &Package, id: &str) -> bool {
+    let name = id.split_once("::").map(|x| x.1).unwrap_or(id);
+    pkg.exclude.iter().any(|p| glob(p, name))
 }
 
 fn hex(fp: &[u8; 32]) -> String {
@@ -215,47 +230,85 @@ fn save(path: &Path, map: &Map) {
 fn main() {
     let o = options();
     let pkg = package();
-    let ctx = context(&o, &pkg);
-    let path = map_path(&pkg, &ctx);
     match o.command.as_str() {
         "init" => {
             let (crates, items, sides, tests) = measure(&o, &pkg, None);
-            let items = items
-                .iter()
-                .map(|(k, it)| (k.clone(), MapItem { fingerprint: hex(&it.fingerprint), sides: sides.get(k).cloned().unwrap_or_default() }))
-                .collect();
+            // After the build, which writes Cargo.lock where none was.
+            let ctx = context(&o, &pkg);
+            let path = map_path(&pkg, &ctx);
+            let items = items.iter().map(|(k, it)| (k.clone(), map_item(it, sides.get(k)))).collect();
             save(&path, &Map { format: FORMAT, context: ctx, crates, items, tests });
             eprintln!("    Saved the map: {}", path.display());
         }
-        "check" => std::process::exit(check(&o, &pkg, &path, ctx)),
-        "look-for-nondeterminism" => std::process::exit(look_for_nondeterminism(&o, &pkg, &path)),
+        "check" => {
+            let ctx = context(&o, &pkg);
+            std::process::exit(check(&o, &pkg, &map_path(&pkg, &ctx), ctx))
+        }
+        "look-for-nondeterminism" => std::process::exit(look_for_nondeterminism(&o, &pkg, &map_path(&pkg, &context(&o, &pkg)))),
         other => panic!("a command this tool knows: init, check, look-for-nondeterminism (not {other:?})"),
     }
 }
 
+/// For each side and index: the tests that reach it.
+fn reachers(tests: &BTreeMap<String, MapTest>) -> BTreeMap<(String, u32), BTreeSet<String>> {
+    let mut by: BTreeMap<(String, u32), BTreeSet<String>> = BTreeMap::new();
+    for (id, t) in tests {
+        for (k, sides) in &t.reach {
+            for s in sides {
+                by.entry((k.clone(), *s)).or_default().insert(id.clone());
+            }
+        }
+    }
+    by
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
+}
+
+/// A list of names for a report: up to four, then how many more.
+fn few<T: std::fmt::Display>(names: &[T]) -> String {
+    let shown: Vec<String> = names.iter().take(4).map(|n| n.to_string()).collect();
+    if names.len() > 4 { format!("{} and {} more", shown.join(", "), names.len() - 4) } else { shown.join(", ") }
+}
+
+/// Each new side matched to its earlier version's side of the same kind
+/// at the same token, the two versions' tokens aligned (Myers' diff): an
+/// index into the old sides, or None for a side in new tokens.
+fn match_sides(old: &MapItem, new_tokens: &[u32], new_sides: &[Side]) -> Vec<Option<u32>> {
+    let mut new_to_old = vec![None; new_tokens.len() + 1];
+    for op in similar::capture_diff_slices(similar::Algorithm::Myers, &old.tokens, new_tokens) {
+        if let similar::DiffOp::Equal { old_index, new_index, len } = op {
+            for i in 0..len {
+                new_to_old[new_index + i] = Some(old_index + i);
+            }
+        }
+    }
+    // A side starting at the end of the function (no token) maps to the end.
+    new_to_old[new_tokens.len()] = Some(old.tokens.len());
+    let by_place: BTreeMap<(u32, u8), u32> = old.sides.iter().enumerate().map(|(i, s)| ((s.token, s.kind), i as u32)).collect();
+    new_sides.iter().map(|s| new_to_old[s.token as usize].and_then(|t0| by_place.get(&(t0 as u32, s.kind)).copied())).collect()
+}
+
 /// Check the source against the map: report each side that lost its last
-/// reaching test, and each side of changed code no test reaches, each with
-/// its cause. Saves the new map when it finds nothing (or with --accept),
-/// so a finding stays until it is fixed or accepted. The exit status: 0
-/// when it finds nothing.
+/// reaching test, and each side of new code no test reaches, each with its
+/// cause. Saves the new map when it finds nothing (or with --accept), so a
+/// finding stays until it is fixed or accepted. The exit status: 0 when it
+/// finds nothing.
 fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
     let t = Instant::now();
     let old = load(path);
-    let now = all_items(&old.crates);
+    let now = all_items(&pkg.dir, &old.crates);
     let changed: BTreeSet<String> =
         now.iter().filter(|(k, it)| old.items.get(*k).is_none_or(|m| m.fingerprint != hex(&it.fingerprint))).map(|(k, _)| k.clone()).collect();
     let gone: BTreeSet<String> = old.items.keys().filter(|k| !now.contains_key(*k)).cloned().collect();
-    let is_included = |id: &str| {
-        let name = id.split_once("::").map(|x| x.1).unwrap_or(id);
-        !pkg.exclude.iter().any(|p| glob(p, name))
-    };
-    let removed_tests: BTreeSet<String> = old.tests.keys().filter(|id| !now.get(*id).is_some_and(|it| it.is_test) || !is_included(id)).cloned().collect();
+    let removed_tests: BTreeSet<String> = old.tests.keys().filter(|id| !now.get(*id).is_some_and(|it| it.is_test) || excluded(pkg, id)).cloned().collect();
     // Code, not tests: a vanished item that was a test is a removed test.
     let code_changed: BTreeSet<&String> =
         changed.iter().chain(&gone).filter(|k| !now.get(*k).is_some_and(|it| it.is_test) && !old.tests.contains_key(*k)).collect();
     // The tests to measure again: those changed or new, and those whose
     // reach includes changed or vanished code.
-    let mut affected: BTreeSet<String> = now.iter().filter(|(k, it)| it.is_test && changed.contains(*k) && is_included(k)).map(|(k, _)| k.clone()).collect();
+    let mut affected: BTreeSet<String> = now.iter().filter(|(k, it)| it.is_test && changed.contains(*k) && !excluded(pkg, k)).map(|(k, _)| k.clone()).collect();
     for (id, test) in &old.tests {
         if !removed_tests.contains(id) && test.reach.keys().any(|k| code_changed.contains(k)) {
             affected.insert(id.clone());
@@ -263,51 +316,77 @@ fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
     }
     let mut tests: BTreeMap<String, MapTest> =
         old.tests.iter().filter(|(id, _)| !removed_tests.contains(*id) && !affected.contains(*id)).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let mut sides: BTreeMap<String, Vec<String>> = old.items.iter().map(|(k, m)| (k.clone(), m.sides.clone())).collect();
+    let mut sides: BTreeMap<String, Vec<Side>> = old.items.iter().map(|(k, m)| (k.clone(), m.sides.clone())).collect();
     let tier = if affected.is_empty() && code_changed.is_empty() { "lookup" } else { "measured" };
     if tier == "measured" {
         let (_, _, new_sides, measured) = measure(o, pkg, Some(&affected));
         sides = new_sides;
         tests.extend(measured);
     }
-    // Who reaches each side, before and after.
-    let reachers = |tests: &BTreeMap<String, MapTest>| {
-        let mut by: BTreeMap<(String, u32), BTreeSet<String>> = BTreeMap::new();
-        for (id, t) in tests {
-            for (k, sides) in &t.reach {
-                for s in sides {
-                    by.entry((k.clone(), *s)).or_default().insert(id.clone());
-                }
-            }
-        }
-        by
-    };
     let before = reachers(&old.tests);
     let after = reachers(&tests);
-    let mut findings = Vec::new();
-    // Unchanged code that lost its last reaching test.
+    // Why the tests that reached a side reach it no longer: removed, changed
+    // themselves, or run through changed code (these functions).
+    let cause = |who: &BTreeSet<String>| {
+        let removed: Vec<&String> = who.iter().filter(|t| removed_tests.contains(*t)).collect();
+        let changed_tests: Vec<&String> = who.iter().filter(|t| !removed_tests.contains(*t) && changed.contains(*t)).collect();
+        let others = who.len() - removed.len() - changed_tests.len();
+        let mut beneath: BTreeSet<&String> = BTreeSet::new();
+        for t in who.iter().filter(|t| !removed_tests.contains(*t) && !changed.contains(*t)) {
+            beneath.extend(old.tests[t].reach.keys().filter(|k| code_changed.contains(k)));
+        }
+        let mut parts = Vec::new();
+        if !removed.is_empty() {
+            parts.push(format!("it removes {}", few(&removed)));
+        }
+        if !changed_tests.is_empty() {
+            parts.push(format!("it changes {}", few(&changed_tests)));
+        }
+        if others > 0 {
+            parts.push(format!("it changes code the other {others} reaching it ran through: {}", few(&beneath.into_iter().collect::<Vec<_>>())));
+        }
+        parts.join("; ")
+    };
+    // Findings grouped by function and cause: (function, kind, cause) and
+    // the sides.
+    let mut findings: BTreeMap<(String, &str, String), Vec<String>> = BTreeMap::new();
+    // Unchanged functions: each side that lost its last reaching test.
     for ((k, s), who) in &before {
         if changed.contains(k) || gone.contains(k) || after.contains_key(&(k.clone(), *s)) {
             continue;
         }
-        let side = old.items.get(k).and_then(|m| m.sides.get(*s as usize)).cloned().unwrap_or_default();
-        let causes: Vec<String> =
-            who.iter().map(|t| if removed_tests.contains(t) { format!("removes {t}") } else { format!("changes {t}, which reaches it no longer") }).collect();
-        findings.push(format!("{k}, {side}: reached by no test; this change {}", causes.join(", and ")));
+        findings.entry((k.clone(), "reached by no test since this change", cause(who))).or_default().push(old.items[k].sides[*s as usize].name.clone());
     }
-    // Changed code no test reaches.
+    // Changed functions: each side matched to its earlier version's by the
+    // functions' tokens. A matched side reached before and by no test now has
+    // lost its reach; a side of new tokens no test reaches is new code
+    // untested; a side unreached before and after is no effect of this
+    // change.
     for k in &changed {
-        if now.get(k).is_some_and(|it| it.is_test) {
+        let (Some(it), Some(new_sides)) = (now.get(k), sides.get(k)) else { continue };
+        if it.is_test {
             continue;
         }
-        for (s, side) in sides.get(k).into_iter().flatten().enumerate() {
-            if !after.contains_key(&(k.clone(), s as u32)) {
-                findings.push(format!("{k}, {side}: changed code, reached by no test"));
+        let new_tokens: Vec<u32> = it.tokens.iter().map(|t| t.hash).collect();
+        let matched = old.items.get(k).map(|m| match_sides(m, &new_tokens, new_sides)).unwrap_or_else(|| vec![None; new_sides.len()]);
+        for (s, side) in new_sides.iter().enumerate() {
+            if after.contains_key(&(k.clone(), s as u32)) {
+                continue;
+            }
+            match matched[s] {
+                Some(s0) => {
+                    if let Some(who) = before.get(&(k.clone(), s0)) {
+                        findings.entry((k.clone(), "reached by no test since this change to it", cause(who))).or_default().push(side.name.clone());
+                    }
+                }
+                None => findings.entry((k.clone(), "new code, reached by no test", String::new())).or_default().push(side.name.clone()),
             }
         }
     }
-    for f in &findings {
-        println!("{f}");
+    let count: usize = findings.values().map(Vec::len).sum();
+    for ((k, what, why), sides) in &findings {
+        let why = if why.is_empty() { String::new() } else { format!(": {why}") };
+        println!("{k}: {} {what}{why}\n    {}", plural(sides.len(), "side"), few(sides));
     }
     eprintln!(
         "    Checked by {tier} in {:.1?}: {} items changed, {} vanished, {} tests removed, {} measured again; {} findings",
@@ -316,11 +395,10 @@ fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
         gone.len(),
         removed_tests.len(),
         affected.len(),
-        findings.len()
+        count
     );
     if findings.is_empty() || o.accept {
-        let items =
-            now.iter().map(|(k, it)| (k.clone(), MapItem { fingerprint: hex(&it.fingerprint), sides: sides.get(k).cloned().unwrap_or_default() })).collect();
+        let items = now.iter().map(|(k, it)| (k.clone(), map_item(it, sides.get(k)))).collect();
         save(path, &Map { format: FORMAT, context: ctx, crates: old.crates, items, tests });
         0
     } else {
@@ -333,7 +411,7 @@ fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
 /// find nondeterminism, never prove its absence.
 fn look_for_nondeterminism(o: &Options, pkg: &Package, path: &Path) -> i32 {
     let old = load(path);
-    let now = all_items(&old.crates);
+    let now = all_items(&pkg.dir, &old.crates);
     let changed = now.iter().filter(|(k, it)| old.items.get(*k).is_none_or(|m| m.fingerprint != hex(&it.fingerprint))).count();
     assert_eq!(changed, 0, "the source differs from the map's: check it first, then look for nondeterminism");
     let (_, _, _, measured) = measure(o, pkg, None);

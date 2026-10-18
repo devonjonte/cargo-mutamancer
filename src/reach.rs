@@ -39,6 +39,9 @@ impl Build {
             .args(["test", "--no-run", "--message-format=json-render-diagnostics"])
             .args(&self.cargo_args)
             .env("RUSTFLAGS", flags.trim())
+            // Instrumented build scripts write profiles when they run: into
+            // the tool's directory, never the source tree.
+            .env("LLVM_PROFILE_FILE", self.target_dir.join("build-scripts-%p.profraw"))
             .env("CARGO_TARGET_DIR", &self.target_dir)
             .current_dir(&self.manifest_dir)
             .stderr(std::process::Stdio::inherit())
@@ -60,10 +63,16 @@ impl Build {
     }
 }
 
-/// The tests a binary runs by default (its ignored ones left out).
-pub fn list_tests(bin: &Binary) -> Vec<String> {
+/// The tests a binary runs by default (its ignored ones left out). The
+/// profile the instrumented binary writes as it lists goes under `dir`.
+pub fn list_tests(bin: &Binary, dir: &Path) -> Vec<String> {
     let list = |extra: &[&str]| -> BTreeSet<String> {
-        let out = Command::new(&bin.exe).args(["--list", "--format", "terse"]).args(extra).output().expect("listing tests");
+        let out = Command::new(&bin.exe)
+            .args(["--list", "--format", "terse"])
+            .args(extra)
+            .env("LLVM_PROFILE_FILE", dir.join("list-%p.profraw"))
+            .output()
+            .expect("listing tests");
         String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.strip_suffix(": test")).map(str::to_string).collect()
     };
     let ignored = list(&["--ignored"]);
@@ -71,10 +80,20 @@ pub fn list_tests(bin: &Binary) -> Vec<String> {
 }
 
 /// A function's branch sides and code regions, in source order: what a
-/// test can reach in it. Each is named for the reports by its kind and
-/// line (`line 12, branch true`); in the map, by its index here, which
-/// layout and formatting leave as it is.
-pub type Sides = Vec<String>;
+/// test can reach in it. In the map each is known by its index here, which
+/// layout and formatting leave as they are.
+pub type Sides = Vec<Side>;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Side {
+    /// For the reports: its line and column, and its kind.
+    pub name: String,
+    /// 0 code, 1 a branch's true side, 2 its false side.
+    pub kind: u8,
+    /// The function's token it starts at: what matches it to its
+    /// counterpart in another version of the function.
+    pub token: u32,
+}
 
 /// Where each counted region of a binary falls: for each function record
 /// (by its name hash), the counters to read and the item side each
@@ -82,8 +101,10 @@ pub type Sides = Vec<String>;
 pub struct Layout {
     exe: PathBuf,
     version: u64,
-    places: Vec<(u64, Vec<(Counter, String, u32)>)>,
-    expressions: HashMap<u64, Vec<Expression>>,
+    /// Each function record: its name hash, its own expressions (records
+    /// may share a hash: copies in several codegen units, unused
+    /// functions), and where each of its counters lands.
+    places: Vec<(u64, Vec<Expression>, Vec<(Counter, String, u32)>)>,
 }
 
 /// The item containing `line` of `file` (`by_file` sorted by first line).
@@ -110,8 +131,7 @@ pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) ->
     let mut per_bin = Vec::new();
     for bin in bins {
         let info = read_object_file(&bin.exe, version).unwrap_or_else(|e| panic!("reading the coverage map of {}: {e}", bin.exe.display()));
-        let mut placed: Vec<(u64, Vec<(Counter, String, At)>)> = Vec::new();
-        let mut expressions = HashMap::new();
+        let mut placed: Vec<(u64, Vec<Expression>, Vec<(Counter, String, At)>)> = Vec::new();
         for f in &info.cov_fun {
             let paths = info.get_files_from_id(f.header.filenames_ref);
             let mut list = Vec::new();
@@ -131,30 +151,39 @@ pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) ->
                 }
             }
             if !list.is_empty() {
-                expressions.insert(f.header.name_hash, f.expressions.clone());
-                placed.push((f.header.name_hash, list));
+                placed.push((f.header.name_hash, f.expressions.clone(), list));
             }
         }
-        per_bin.push((bin.exe.clone(), placed, expressions));
+        per_bin.push((bin.exe.clone(), placed));
     }
     let index: BTreeMap<&String, BTreeMap<At, u32>> =
         regions.iter().map(|(k, set)| (k, set.iter().enumerate().map(|(i, at)| (*at, i as u32)).collect())).collect();
     let sides = regions
         .iter()
         .map(|(k, set)| {
-            (k.clone(), set.iter().map(|(line, col, kind)| format!("{line}:{col} {}", ["code", "branch true", "branch false"][*kind as usize])).collect())
+            let tokens = &items[k].tokens;
+            let sides = set
+                .iter()
+                .map(|&(line, col, kind)| Side {
+                    name: format!("{line}:{col} {}", ["code", "branch true", "branch false"][kind as usize]),
+                    kind,
+                    token: tokens.iter().position(|t| (t.line, t.col) >= (line, col)).unwrap_or(tokens.len()) as u32,
+                })
+                .collect();
+            (k.clone(), sides)
         })
         .collect();
     let layouts = per_bin
         .into_iter()
-        .map(|(exe, placed, expressions)| Layout {
+        .map(|(exe, placed)| Layout {
             exe,
             version,
             places: placed
                 .into_iter()
-                .map(|(h, list)| {
+                .map(|(h, e, list)| {
                     (
                         h,
+                        e,
                         list.into_iter()
                             .map(|(c, k, at)| {
                                 let i = index[&k][&at];
@@ -164,7 +193,6 @@ pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) ->
                     )
                 })
                 .collect(),
-            expressions,
         })
         .collect();
     (sides, layouts)
@@ -176,10 +204,9 @@ impl Layout {
         let prof = llvm_profparser::parse(profile).unwrap_or_else(|e| panic!("reading {}: {e}", profile.display()));
         assert_eq!(prof.version(), Some(self.version), "{}: a profile of another format version", self.exe.display());
         let mut out: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-        for (hash, list) in &self.places {
+        for (hash, exprs, list) in &self.places {
             let Some(rec) = prof.find_record_by_hash(*hash) else { continue };
             let counts = &rec.record.counts;
-            let exprs = &self.expressions[hash];
             let mut memo = HashMap::new();
             for (c, key, i) in list {
                 if eval(c, counts, exprs, &mut memo) > 0 {
