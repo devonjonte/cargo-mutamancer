@@ -47,12 +47,17 @@ yes or no, never as a count: counts vary with timing when reach does not.
 
 A map is a deterministic function of the source tree and the context (the
 toolchain, `Cargo.lock`, flags, target, and the context the crate declares,
-such as its CPU features). It records the commit id, the tree id, and the
-context it was made from, and a BLAKE3 hash of its content; it is stored
-in git, keyed by the commit id, so git's content addressing binds it to
-its commit. A map whose tree is not the parent's, or whose context is not
-the current one, is refused, never used. Anyone can verify a map by
-computing it again: the self-audit (below).
+such as its CPU features). It records the tree id and the context it was
+made from, and a BLAKE3 hash of its content. It is stored in git as a tree
+of small content-addressed objects (one per function version, one per
+test's reach), so a commit adds only what it changed; maps are keyed by
+tree id, the exact content committed. The pre-commit check measures the
+index's tree (`git write-tree`), never the working directory, and stops
+if the working directory's Rust sources differ from it; a post-commit hook
+binds the new commit to its map with a note, which anyone can verify (the
+map records the commit's own tree id). A map whose tree is not the
+parent's, or whose context is not the current one, is refused, never used.
+Anyone can verify a map by computing it again: the self-audit (below).
 
 ## Deciding what to redo: exactly
 
@@ -76,9 +81,14 @@ computing it again: the self-audit (below).
 ## Changed functions: an explicit list, never an inference
 
 In a function the commit changes, every mutant must be caught by a test or
-named in the crate's list of explained survivors (with its reason). A
-survivor already there becomes a list entry, which the commit's author sees
-and confirms; nothing is matched or inferred between a function's versions.
+named in the crate's list of explained survivors, with its reason. An
+entry belongs to one version of its function (by its fingerprint) and
+names its mutant's exact site (token position and text): when the function
+changes, its entries expire, and the tool shows the new version's survivors
+for its author to confirm. No site is ever carried from one version of a
+function to another, since that identity can only be guessed (as a
+three-way merge guesses where a moved line went: see
+[badmerge](https://tahoe-lafs.org/~zooko/badmerge/simple.html)).
 
 ## Determinism: the user's promise
 
@@ -107,12 +117,14 @@ nondeterminism, never prove its absence.
 ## Running it
 
 - **The hook** checks each commit against its parent, before it is made.
-- **CI**, in either of two modes: **per commit** (each pushed commit in
-  order, each against its parent: exact, and each finding names its
-  commit), or **per push** (the push's newest commit against the commit it
-  started from: exact for the push as a whole, its findings naming the
-  push; a loss a later commit in the same push repaired is not reported).
-  Starting again from scratch is no third mode: it discards every cause.
+- **CI**, in either of two modes. **Per commit**, the recommended one:
+  each pushed commit in order, each against its parent; each finding names
+  its commit, a loss a later commit repaired is still reported, and each
+  version's survivors are confirmed as it is made. **Per push**: the
+  push's newest commit against the commit it started from, one check; the
+  verdict compares two measured states, so it needs no intermediate
+  commit, but its findings name only the push. Starting again from scratch
+  is no third mode: it discards every cause.
 - **Every core**, with cargo's jobserver honored; progress as cargo shows
   it; findings in a fixed order.
 
@@ -132,7 +144,7 @@ failure at once, the ones not yet imagined among them.
 | a change makes a mutant elsewhere uncaught (action at a distance) | the exact rule: judged again when a test reaching it runs again |
 | a dependency or toolchain upgrade | the same source measured under both contexts, the difference reported against the upgrade |
 | tests and functions a macro generates | fingerprinted by the macro's invocation; a test the tool cannot place is reported at `init` |
-| matching a changed function to its earlier version | none needed: the explicit list |
+| matching a changed function to its earlier version | none needed: the explicit list, its entries bound to one version |
 | a test that is not deterministic, unexcluded | `look-for-nondeterminism`; the self-audit |
 | code only excluded tests reach | reported as unprotected |
 | another machine reaches other code (CPU, OS) | CI on each platform; the hook checks its own machine's paths, as the README says |
