@@ -21,12 +21,10 @@ pub struct Binary {
     pub exe: PathBuf,
 }
 
-/// What a build produced: its test binaries, when it started (no IR file
-/// may be older), and the native archives its package's build scripts
-/// wrote (assembly and C).
+/// What a build produced: its test binaries, and the native archives its
+/// package's build scripts wrote (assembly and C).
 pub struct Built {
     pub bins: Vec<Binary>,
-    pub started: std::time::SystemTime,
     pub archives: Vec<PathBuf>,
 }
 
@@ -40,16 +38,20 @@ pub struct Build {
 }
 
 impl Build {
-    /// Build every test binary with coverage and its IR (`--emit=llvm-ir`,
-    /// for compiled fingerprints); debug information off, and panic
-    /// locations without file and line (`-Z location-detail=none`), so a
-    /// line moved changes no function's code.
-    pub fn binaries(&self) -> Built {
-        let started = std::time::SystemTime::now();
+    /// Build every test binary with coverage, this tool as the compiler
+    /// wrapper fingerprinting each function of the package's crates
+    /// (compiled.rs) into `fingerprints`. MIR inlining off (`-Z
+    /// inline-mir=no`), so each function's MIR is its own code; debug
+    /// information off, and panic locations without file and line (`-Z
+    /// location-detail=none`), so a line moved changes no function's code.
+    pub fn binaries(&self, fingerprints: &Path) -> Built {
         let flags = format!(
-            "{} -C instrument-coverage -Z coverage-options=branch --emit=llvm-ir,link -C debuginfo=0 -Z location-detail=none",
+            "{} -C instrument-coverage -Z coverage-options=branch -Z inline-mir=no -C debuginfo=0 -Z location-detail=none",
             std::env::var("RUSTFLAGS").unwrap_or_default()
         );
+        let _ = std::fs::remove_dir_all(fingerprints);
+        std::fs::create_dir_all(fingerprints).expect("the fingerprints' directory");
+        let me = std::env::current_exe().expect("this tool's path");
         let out = Command::new("cargo")
             .arg(format!("+{}", self.toolchain))
             .args(["test", "--no-run", "--message-format=json-render-diagnostics"])
@@ -59,6 +61,9 @@ impl Build {
             // the tool's directory, never the source tree.
             .env("LLVM_PROFILE_FILE", self.target_dir.join("build-scripts-%p.profraw"))
             .env("CARGO_TARGET_DIR", &self.target_dir)
+            .env("RUSTC_WORKSPACE_WRAPPER", me)
+            .env(crate::compiled::OUT, fingerprints)
+            .env(crate::compiled::PACKAGE, self.manifest_dir.canonicalize().unwrap_or(self.manifest_dir.clone()))
             .current_dir(&self.manifest_dir)
             .stderr(std::process::Stdio::inherit())
             .output()
@@ -89,7 +94,7 @@ impl Build {
             bins.push(Binary { id, root: PathBuf::from(v["target"]["src_path"].as_str().unwrap()), exe: PathBuf::from(v["executable"].as_str().unwrap()) });
         }
         archives.sort();
-        Built { bins, started, archives }
+        Built { bins, archives }
     }
 }
 

@@ -9,8 +9,11 @@
 //! OPTIONS: `-j N` (workers; one per CPU by default), `--toolchain T`
 //! (the nightly that builds with branch coverage; `nightly` by default).
 
-mod ir;
+#![feature(rustc_private)]
+
+mod compiled;
 mod items;
+mod native;
 mod reach;
 mod store;
 
@@ -175,6 +178,21 @@ fn all_items(dir: &Path, crates: &BTreeMap<String, PathBuf>) -> (BTreeMap<String
     (items, others, files)
 }
 
+/// The tool is the compiler for the package's crates (compiled.rs), so the
+/// user's toolchain must be the one it was built with.
+fn toolchain_matches(o: &Options) {
+    let out = Command::new("rustc").arg(format!("+{}", o.toolchain)).arg("-vV").output().expect("running rustc");
+    let v = String::from_utf8_lossy(&out.stdout);
+    let commit = v.lines().find_map(|l| l.strip_prefix("commit-hash: ")).unwrap_or("");
+    assert_eq!(
+        commit,
+        env!("MUTAMANCER_RUSTC_COMMIT"),
+        "toolchain {} is not the one this tool was built with: install it with that toolchain (`cargo +{} install cargo-mutamancer`)",
+        o.toolchain,
+        o.toolchain
+    );
+}
+
 /// A test's id is its item's key: its crate, then libtest's name.
 fn test_id(bin: &Binary, name: &str) -> String {
     format!("{}::{name}", bin.id)
@@ -202,18 +220,65 @@ struct Measured {
     tests: Vec<(Binary, String)>,
 }
 
-/// Build the test binaries with coverage and IR, and read what they hold:
-/// sides, compiled fingerprints, the included tests.
+/// Each item's compiled fingerprint: the fingerprints the compiler wrapper
+/// wrote (compiled.rs) of the functions in it (the item itself, its
+/// closures; in every crate it was compiled into), with the content of the
+/// native symbols they call.
+fn compiled_fingerprints(
+    dir: &Path,
+    pkg_dir: &Path,
+    items: &BTreeMap<String, Item>,
+    native: &std::collections::HashMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut by_file: BTreeMap<PathBuf, Vec<&Item>> = BTreeMap::new();
+    for it in items.values() {
+        by_file.entry(it.file.canonicalize().unwrap_or(it.file.clone())).or_default().push(it);
+    }
+    let mut parts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for e in std::fs::read_dir(dir).expect("the fingerprints").flatten() {
+        let entries: Vec<compiled::Entry> = serde_json::from_slice(&std::fs::read(e.path()).unwrap()).expect("fingerprints");
+        for en in entries {
+            let file = pkg_dir.join(&en.file);
+            let file = file.canonicalize().unwrap_or(file);
+            // The innermost item containing the function (a closure's own).
+            let Some(it) = by_file
+                .get(&file)
+                .and_then(|v| v.iter().filter(|it| it.lines.0 <= en.lines.0 && en.lines.1 <= it.lines.1).min_by_key(|it| it.lines.1 - it.lines.0))
+            else {
+                continue;
+            };
+            let mut part = en.fingerprint.clone();
+            for f in &en.foreign {
+                part.push_str(&format!(" {f}:{}", native.get(f).map(String::as_str).unwrap_or("extern")));
+            }
+            parts.entry(it.key.clone()).or_default().insert(part);
+        }
+    }
+    parts
+        .into_iter()
+        .map(|(k, set)| {
+            let mut h = blake3::Hasher::new_derive_key("cargo-mutamancer 2026-10-18 item compiled v1");
+            for p in &set {
+                h.update(&(p.len() as u64).to_le_bytes());
+                h.update(p.as_bytes());
+            }
+            (k, h.finalize().to_hex().to_string())
+        })
+        .collect()
+}
+
+/// Build the test binaries with coverage, the compiler wrapper writing each
+/// function's fingerprint, and read what they hold: sides, compiled
+/// fingerprints, the included tests.
 fn build(o: &Options, pkg: &Package) -> Measured {
     let t = Instant::now();
     let b = Build { toolchain: o.toolchain.clone(), cargo_args: o.cargo_args.clone(), manifest_dir: pkg.dir.clone(), target_dir: pkg.target.join("build") };
-    let built = b.binaries();
+    let built = b.binaries(&pkg.target.join("fingerprints"));
     let crates: BTreeMap<String, PathBuf> = built.bins.iter().map(|b| (b.id.clone(), b.root.strip_prefix(&pkg.dir).unwrap_or(&b.root).to_path_buf())).collect();
     let (items, others, _) = all_items(&pkg.dir, &crates);
     let version = reach::profile_version(&built.bins[0], &pkg.target.join("profiles"));
-    let (sides, layouts, owner) = reach::layouts(&built.bins, &items, version);
-    let irs: Vec<ir::Binary> = built.bins.iter().map(|bin| ir::Binary::read(&ir::files(&bin.exe, built.started), &built.archives)).collect();
-    let compiled = ir::fingerprints(&irs, &owner);
+    let (sides, layouts, _) = reach::layouts(&built.bins, &items, version);
+    let compiled = compiled_fingerprints(&pkg.target.join("fingerprints"), &pkg.dir, &items, &native::symbols(&built.archives));
     let mut tests = Vec::new();
     for bin in &built.bins {
         for name in reach::list_tests(bin, &pkg.target) {
@@ -332,7 +397,15 @@ fn pending(store: &store::Store) -> PathBuf {
 }
 
 fn main() {
+    // Started by cargo as the compiler wrapper: compile, fingerprinting.
+    if compiled::is_wrapper() {
+        compiled::wrap();
+    }
     let o = options();
+    // The commands that build: the toolchain must be the tool's own.
+    if matches!(o.command.as_str(), "init" | "check" | "look-for-nondeterminism") {
+        toolchain_matches(&o);
+    }
     let pkg = package();
     match o.command.as_str() {
         "init" => {
