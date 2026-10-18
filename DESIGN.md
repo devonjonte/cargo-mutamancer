@@ -66,11 +66,21 @@ Anyone can verify a map by computing it again: the self-audit (below).
   each function's tokens with doc comments left out) decide the instant
   tier: a commit that changes only tests, formatting, or comments compiles
   nothing else differently and needs no build.
-- **Compiled fingerprints** decide the rest. Each function is fingerprinted
-  by its compiled code, its references to other symbols written by name.
-  Whatever changes behavior changes that code: a constant it uses, a
-  type's layout, a macro's expansion, a `cfg`, an inlined callee, a
-  dependency, the toolchain; assembly and C by their object code.
+- **Compiled fingerprints** decide the rest, and come from the compiler
+  itself. The tool runs as cargo's `RUSTC_WORKSPACE_WRAPPER` during the
+  coverage build, and for each function hashes its optimized MIR, rustc's
+  own record of what it does, with rustc's stable hashing (spans left out,
+  coverage's bookkeeping stripped), together with the fingerprints of the
+  constants and statics it refers to (which MIR names unevaluated, or as
+  pointers to their allocations) and the content of the native symbols it
+  calls (from the build scripts' archives). A constant's value, a type's
+  definition, a macro's expansion, a `cfg`, or the assembly behind an
+  `extern` changes the fingerprint of every function that uses it; a
+  reformat changes none. MIR inlining is off in the build, so a function's
+  MIR is its own code. Measured on a large BLAKE3 commit: LLVM's optimized
+  IR changed for about 190 functions, about 180 of them falsely (inlining,
+  attribute inference, and codegen partitioning make each function's IR
+  depend on its neighbors); MIR changed for 54, each a real effect.
 - **The rule.** A deterministic test is run again if and only if it is
   itself a changed function, or it ran a function whose compiled code
   changed, or it read a file whose contents changed. Otherwise its run is
