@@ -1,0 +1,16 @@
+[package]
+name = "cargo-causal-mutation"
+version = "0.1.0"
+edition = "2024"
+description = "Causal mutation testing for Rust: each commit checked for exactly what it changed"
+license = "MIT OR Apache-2.0 OR TGPPL-1.0 OR BOSL-1.0"
+repository = "https://github.com/johnservil/cargo-causal-mutation"
+
+[dependencies]
+blake3 = "1"
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+llvm_profparser = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
