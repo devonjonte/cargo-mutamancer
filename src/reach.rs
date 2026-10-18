@@ -86,8 +86,6 @@ pub type Sides = Vec<Side>;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Side {
-    /// For the reports: its line and column, and its kind.
-    pub name: String,
     /// 0 code, 1 a branch's true side, 2 its false side.
     pub kind: u8,
     /// The function's token it starts at: what matches it to its
@@ -164,11 +162,7 @@ pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) ->
             let tokens = &items[k].tokens;
             let sides = set
                 .iter()
-                .map(|&(line, col, kind)| Side {
-                    name: format!("{line}:{col} {}", ["code", "branch true", "branch false"][kind as usize]),
-                    kind,
-                    token: tokens.iter().position(|t| (t.line, t.col) >= (line, col)).unwrap_or(tokens.len()) as u32,
-                })
+                .map(|&(line, col, kind)| Side { kind, token: tokens.iter().position(|t| (t.line, t.col) >= (line, col)).unwrap_or(tokens.len()) as u32 })
                 .collect();
             (k.clone(), sides)
         })
@@ -294,4 +288,12 @@ pub fn run_tests(tests: &[(Binary, String)], manifest_dir: &Path, dir: &Path, jo
     let failed = failed.into_inner().unwrap();
     assert!(failed.is_empty(), "tests fail, and the map needs passing tests: {failed:?}");
     paths
+}
+
+/// A side as a report names it: where its token is in `item` (the version
+/// it belongs to, whose tokens its index counts), and its kind.
+pub fn side_name(item: &Item, side: &Side) -> String {
+    let t = item.tokens.get(side.token as usize).or(item.tokens.last());
+    let (line, col) = t.map(|t| (t.line, t.col)).unwrap_or(item.lines);
+    format!("{line}:{col} {}", ["code", "branch true", "branch false"][side.kind as usize])
 }

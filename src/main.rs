@@ -11,6 +11,7 @@
 
 mod items;
 mod reach;
+mod store;
 
 use items::Item;
 use reach::{Binary, Build, Side};
@@ -142,10 +143,6 @@ fn context(o: &Options, pkg: &Package) -> String {
     )
 }
 
-fn map_path(pkg: &Package, context: &str) -> PathBuf {
-    pkg.target.join("maps").join(format!("{}.json", &blake3::hash(context.as_bytes()).to_hex()[..16]))
-}
-
 /// Every crate's items, keyed `CRATE::path` (CRATE `lib` or `test:NAME`).
 fn all_items(dir: &Path, crates: &BTreeMap<String, PathBuf>) -> BTreeMap<String, Item> {
     let mut out = BTreeMap::new();
@@ -214,19 +211,77 @@ fn hex(fp: &[u8; 32]) -> String {
     blake3::Hash::from_bytes(*fp).to_hex().to_string()
 }
 
-fn load(path: &Path) -> Map {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("no map at {}: run `cargo causal-mutation init` first", path.display()));
-    // The format first, so a map of another is refused by name.
-    let format = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["format"].as_u64());
-    assert_eq!(format, Some(FORMAT as u64), "{}: a map of format {format:?}, this tool reads {FORMAT}: run `cargo causal-mutation init` again", path.display());
-    serde_json::from_str(&text).expect("a map of this format")
+/// A map's meta, as stored beside its parts.
+#[derive(Serialize, Deserialize)]
+struct Meta {
+    format: u32,
+    /// The source tree the map measures (git's id).
+    tree: String,
+    context: String,
+    crates: BTreeMap<String, PathBuf>,
+    /// BLAKE3 of the items and tests, as serialized: what binds the parts
+    /// to this meta.
+    content: String,
 }
 
-fn save(path: &Path, map: &Map) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let tmp = path.with_extension("json.new");
-    std::fs::write(&tmp, serde_json::to_vec(map).unwrap()).unwrap();
-    std::fs::rename(tmp, path).unwrap();
+fn content_hash(items: &BTreeMap<String, MapItem>, tests: &BTreeMap<String, MapTest>) -> String {
+    blake3::hash(&serde_json::to_vec(&(items, tests)).unwrap()).to_hex().to_string()
+}
+
+/// Write `map`, the map of source tree `tree`, into git; its tree.
+fn save(store: &store::Store, map: &Map, tree: gix::ObjectId) -> gix::ObjectId {
+    let meta = Meta {
+        format: FORMAT,
+        tree: tree.to_string(),
+        context: map.context.clone(),
+        crates: map.crates.clone(),
+        content: content_hash(&map.items, &map.tests),
+    };
+    store.write(&store::Parts { meta, items: map.items.clone(), tests: map.tests.clone() })
+}
+
+/// The map bound to `commit` in `context`: refused unless it measures that
+/// commit's tree, in this context, its parts its meta's.
+fn load(store: &store::Store, context: &str, commit: gix::ObjectId) -> Map {
+    let id = store
+        .note(context, commit)
+        .unwrap_or_else(|| panic!("commit {commit} has no map in this context: run `cargo causal-mutation init` on a clean checkout of it"));
+    let parts: store::Parts<Meta, MapItem, MapTest> = store.read(id);
+    let m = parts.meta;
+    assert_eq!(m.format, FORMAT, "the map of {commit} is of format {}, this tool reads {FORMAT}: run `cargo causal-mutation init` again", m.format);
+    assert_eq!(m.tree, store.commit_tree(commit).to_string(), "the map bound to {commit} measures another tree");
+    assert_eq!(m.context, context, "the map bound to {commit} has another context");
+    assert_eq!(m.content, content_hash(&parts.items, &parts.tests), "the map bound to {commit} does not match its content hash");
+    Map { format: m.format, context: m.context, crates: m.crates, items: parts.items, tests: parts.tests }
+}
+
+/// The source tree being committed: the index's (`git write-tree`). The
+/// check measures the working directory, so it stops where the working
+/// directory's tracked files differ from the index, or an untracked Rust
+/// file could be built.
+fn staged_tree(pkg: &Package) -> gix::ObjectId {
+    let git = |args: &[&str]| Command::new("git").args(args).current_dir(&pkg.dir).output().expect("running git");
+    let unstaged = git(&["diff", "--name-only"]);
+    assert!(
+        unstaged.stdout.is_empty(),
+        "unstaged changes in {}: stage or stash them, so the check measures what is committed",
+        String::from_utf8_lossy(&unstaged.stdout).trim()
+    );
+    let untracked = git(&["ls-files", "--others", "--exclude-standard", "--", "*.rs"]);
+    assert!(
+        untracked.stdout.is_empty(),
+        "untracked Rust files: {}: add or remove them, so the check measures what is committed",
+        String::from_utf8_lossy(&untracked.stdout).trim()
+    );
+    let out = git(&["write-tree"]);
+    assert!(out.status.success(), "git write-tree failed");
+    gix::ObjectId::from_hex(String::from_utf8_lossy(&out.stdout).trim().as_bytes()).expect("a tree id")
+}
+
+/// Where the pre-commit check names the map it wrote, for the post-commit
+/// hook to bind: the map's tree and the source tree it measures.
+fn pending(store: &store::Store) -> PathBuf {
+    store.git_dir().join("causal-mutation-pending")
 }
 
 fn main() {
@@ -234,19 +289,23 @@ fn main() {
     let pkg = package();
     match o.command.as_str() {
         "init" => {
+            let store = store::Store::open(&pkg.dir);
+            let (head, head_tree) = store.head().expect("a commit to bind the first map to");
+            assert_eq!(staged_tree(&pkg), head_tree, "the index differs from HEAD: init measures HEAD, on a clean checkout");
             let (crates, items, sides, tests) = measure(&o, &pkg, None);
             // After the build, which writes Cargo.lock where none was.
             let ctx = context(&o, &pkg);
-            let path = map_path(&pkg, &ctx);
             let items = items.iter().map(|(k, it)| (k.clone(), map_item(it, sides.get(k)))).collect();
-            save(&path, &Map { format: FORMAT, context: ctx, crates, items, tests });
-            eprintln!("    Saved the map: {}", path.display());
+            let map = save(&store, &Map { format: FORMAT, context: ctx.clone(), crates, items, tests }, head_tree);
+            store.set_note(&ctx, head, map);
+            eprintln!("    Bound the map {map} to {head}");
         }
         "check" => {
             let ctx = context(&o, &pkg);
-            std::process::exit(check(&o, &pkg, &map_path(&pkg, &ctx), ctx))
+            std::process::exit(check(&o, &pkg, ctx))
         }
-        "look-for-nondeterminism" => std::process::exit(look_for_nondeterminism(&o, &pkg, &map_path(&pkg, &context(&o, &pkg)))),
+        "bind" => bind(&pkg),
+        "look-for-nondeterminism" => std::process::exit(look_for_nondeterminism(&o, &pkg, &context(&o, &pkg))),
         "install-hook" => install_hook(&o),
         other => panic!("a command this tool knows: init, check, look-for-nondeterminism, install-hook (not {other:?})"),
     }
@@ -298,9 +357,12 @@ fn match_sides(old: &MapItem, new_tokens: &[u32], new_sides: &[Side]) -> Vec<Opt
 /// cause. Saves the new map when it finds nothing (or with --accept), so a
 /// finding stays until it is fixed or accepted. The exit status: 0 when it
 /// finds nothing.
-fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
+fn check(o: &Options, pkg: &Package, ctx: String) -> i32 {
     let t = Instant::now();
-    let old = load(path);
+    let store = store::Store::open(&pkg.dir);
+    let (head, _) = store.head().expect("a commit to check against: run init on the first");
+    let old = load(&store, &ctx, head);
+    let tree = staged_tree(pkg);
     let now = all_items(&pkg.dir, &old.crates);
     let changed: BTreeSet<String> =
         now.iter().filter(|(k, it)| old.items.get(*k).is_none_or(|m| m.fingerprint != hex(&it.fingerprint))).map(|(k, _)| k.clone()).collect();
@@ -358,7 +420,10 @@ fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
         if changed.contains(k) || gone.contains(k) || after.contains_key(&(k.clone(), *s)) {
             continue;
         }
-        findings.entry((k.clone(), "reached by no test since this change", cause(who))).or_default().push(old.items[k].sides[*s as usize].name.clone());
+        findings
+            .entry((k.clone(), "reached by no test since this change", cause(who)))
+            .or_default()
+            .push(reach::side_name(&now[k], &old.items[k].sides[*s as usize]));
     }
     // Changed functions: each side matched to its earlier version's by the
     // functions' tokens. A matched side reached before and by no test now has
@@ -379,10 +444,10 @@ fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
             match matched[s] {
                 Some(s0) => {
                     if let Some(who) = before.get(&(k.clone(), s0)) {
-                        findings.entry((k.clone(), "reached by no test since this change to it", cause(who))).or_default().push(side.name.clone());
+                        findings.entry((k.clone(), "reached by no test since this change to it", cause(who))).or_default().push(reach::side_name(it, side));
                     }
                 }
-                None => findings.entry((k.clone(), "new code, reached by no test", String::new())).or_default().push(side.name.clone()),
+                None => findings.entry((k.clone(), "new code, reached by no test", String::new())).or_default().push(reach::side_name(it, side)),
             }
         }
     }
@@ -402,18 +467,37 @@ fn check(o: &Options, pkg: &Package, path: &Path, ctx: String) -> i32 {
     );
     if findings.is_empty() || o.accept {
         let items = now.iter().map(|(k, it)| (k.clone(), map_item(it, sides.get(k)))).collect();
-        save(path, &Map { format: FORMAT, context: ctx, crates: old.crates, items, tests });
+        let map = save(&store, &Map { format: FORMAT, context: ctx.clone(), crates: old.crates, items, tests }, tree);
+        std::fs::write(pending(&store), format!("{map} {tree} {}\n", blake3::hash(ctx.as_bytes()).to_hex())).expect("writing the pending map's name");
         0
     } else {
         1
     }
 }
 
+/// Bind the commit just made to the map its pre-commit check wrote (the
+/// post-commit hook): refused unless the map measures the commit's tree.
+fn bind(pkg: &Package) {
+    let store = store::Store::open(&pkg.dir);
+    let path = pending(&store);
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    std::fs::remove_file(&path).expect("removing the pending map's name");
+    let mut words = text.split_whitespace();
+    let (map, tree, _) = (words.next().unwrap(), words.next().unwrap(), words.next().unwrap());
+    let (head, head_tree) = store.head().expect("the commit just made");
+    assert_eq!(head_tree.to_string(), tree, "the commit's tree is not the one its check measured: run `cargo causal-mutation check` on it");
+    let parts: store::Parts<Meta, MapItem, MapTest> = store.read(gix::ObjectId::from_hex(map.as_bytes()).unwrap());
+    store.set_note(&parts.meta.context, head, gix::ObjectId::from_hex(map.as_bytes()).unwrap());
+}
+
 /// Measure every included test again, with nothing they depend on
 /// changed, and report each whose reach differs from the map's. It can
 /// find nondeterminism, never prove its absence.
-fn look_for_nondeterminism(o: &Options, pkg: &Package, path: &Path) -> i32 {
-    let old = load(path);
+fn look_for_nondeterminism(o: &Options, pkg: &Package, ctx: &str) -> i32 {
+    let store = store::Store::open(&pkg.dir);
+    let (head, head_tree) = store.head().expect("a commit");
+    assert_eq!(staged_tree(pkg), head_tree, "the index differs from HEAD: look for nondeterminism on a clean checkout");
+    let old = load(&store, ctx, head);
     let now = all_items(&pkg.dir, &old.crates);
     let changed = now.iter().filter(|(k, it)| old.items.get(*k).is_none_or(|m| m.fingerprint != hex(&it.fingerprint))).count();
     assert_eq!(changed, 0, "the source differs from the map's: check it first, then look for nondeterminism");
@@ -431,29 +515,31 @@ fn look_for_nondeterminism(o: &Options, pkg: &Package, path: &Path) -> i32 {
     if differing == 0 { 0 } else { 1 }
 }
 
-/// Write the repository's pre-commit hook: `check`, with this command's
-/// options, before each commit. An existing hook this tool did not write is
-/// left as it is, and the command stops.
+/// Write the repository's hooks: pre-commit runs `check` with this
+/// command's options; post-commit binds the new commit to the map the
+/// check wrote. An existing hook this tool did not write is left as it is,
+/// and the command stops.
 fn install_hook(o: &Options) {
-    let out = Command::new("git").args(["rev-parse", "--git-path", "hooks/pre-commit"]).output().expect("running git");
-    assert!(out.status.success(), "not in a git repository");
-    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     const MARK: &str = "# written by cargo causal-mutation install-hook";
-    if let Ok(old) = std::fs::read_to_string(&path) {
-        assert!(old.contains(MARK), "{} exists and is not this tool's: add `cargo causal-mutation check` to it yourself", path.display());
-    }
     let mut args = vec!["--toolchain".to_string(), o.toolchain.clone()];
     if !o.cargo_args.is_empty() {
         args.push("--".into());
         args.extend(o.cargo_args.iter().cloned());
     }
-    let hook = format!("#!/bin/sh\n{MARK}\nexec cargo causal-mutation check {}\n", args.join(" "));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, hook).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (hook, command) in [("pre-commit", format!("check {}", args.join(" "))), ("post-commit", "bind".to_string())] {
+        let out = Command::new("git").args(["rev-parse", "--git-path", &format!("hooks/{hook}")]).output().expect("running git");
+        assert!(out.status.success(), "not in a git repository");
+        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        if let Ok(old) = std::fs::read_to_string(&path) {
+            assert!(old.contains(MARK), "{} exists and is not this tool's: add `cargo causal-mutation {command}` to it yourself", path.display());
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{MARK}\nexec cargo causal-mutation {command}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        eprintln!("    Wrote {}", path.display());
     }
-    eprintln!("    Wrote {}", path.display());
 }
