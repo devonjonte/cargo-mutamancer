@@ -27,6 +27,24 @@ Version 0.1 is in development: the reach map, causal coverage at each
 commit. Version 0.2 adds mutants (the kill map), the tool's reason for
 being. Version 1.0 freezes the interface.
 
+## Use
+
+It needs a nightly toolchain, which builds the tests with LLVM's branch
+coverage:
+
+```sh
+cargo install --git https://github.com/johnservil/cargo-causal-mutation
+cargo causal-mutation init                 # the first map: every test, once
+cargo causal-mutation install-hook         # check each commit before it is made
+cargo causal-mutation check                # the same, by hand
+```
+
+`--toolchain T` names the nightly (`nightly` by default), `-j N` the
+workers, and arguments after `--` go to `cargo test` (features, for
+example). A check that finds nothing saves the new map; one that finds
+something keeps the old one, so its findings stay until they are fixed,
+or accepted with `check --accept`.
+
 ## How it works
 
 - **Fingerprints.** Each function is fingerprinted by its tokens (BLAKE3,
