@@ -62,7 +62,7 @@ Anyone can verify a map by computing it again: the self-audit (below).
 ## Deciding what to redo: exactly
 
 - **Token fingerprints** (BLAKE3, derive-key mode, context
-  `"cargo-causal-mutation 2026-10-18 Rust fn token fingerprint v1"`, over
+  `"cargo-mutamancer 2026-10-18 Rust fn token fingerprint v1"`, over
   each function's tokens with doc comments left out) decide the instant
   tier: a commit that changes only tests, formatting, or comments compiles
   nothing else differently and needs no build.
@@ -93,7 +93,7 @@ three-way merge guesses where a moved line went: see
 ## Determinism: the user's promise
 
 The tests the tool uses are those the user promises are deterministic: all
-but those listed in `[package.metadata.causal-mutation] exclude`. The tool
+but those listed in `[package.metadata.mutamancer] exclude`. The tool
 trusts the promise; `look-for-nondeterminism` looks for breaks in it,
 measuring tests again with nothing they depend on changed. It can find
 nondeterminism, never prove its absence.

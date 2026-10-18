@@ -1,10 +1,10 @@
 [package]
-name = "cargo-causal-mutation"
+name = "cargo-mutamancer"
 version = "0.1.0"
 edition = "2024"
 description = "Causal mutation testing for Rust: each commit checked for exactly what it changed"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0 OR BOSL-1.0"
-repository = "https://github.com/johnservil/cargo-causal-mutation"
+repository = "https://github.com/johnservil/cargo-mutamancer"
 
 [dependencies]
 blake3 = "1"

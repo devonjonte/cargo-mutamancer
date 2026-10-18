@@ -1,14 +1,15 @@
-//! `cargo causal-mutation`: each commit checked for the reach its change
+//! `cargo mutamancer`: each commit checked for the reach its change
 //! cost (version 0.1: the reach map; mutants come in 0.2).
 //!
-//!     cargo causal-mutation init [OPTIONS] [-- CARGO_TEST_ARGS]
-//!     cargo causal-mutation check [--accept] [OPTIONS] [-- CARGO_TEST_ARGS]
-//!     cargo causal-mutation look-for-nondeterminism [OPTIONS] [-- CARGO_TEST_ARGS]
-//!     cargo causal-mutation install-hook [OPTIONS] [-- CARGO_TEST_ARGS]
+//!     cargo mutamancer init [OPTIONS] [-- CARGO_TEST_ARGS]
+//!     cargo mutamancer check [--accept] [OPTIONS] [-- CARGO_TEST_ARGS]
+//!     cargo mutamancer look-for-nondeterminism [OPTIONS] [-- CARGO_TEST_ARGS]
+//!     cargo mutamancer install-hook [OPTIONS] [-- CARGO_TEST_ARGS]
 //!
 //! OPTIONS: `-j N` (workers; one per CPU by default), `--toolchain T`
 //! (the nightly that builds with branch coverage; `nightly` by default).
 
+mod ir;
 mod items;
 mod reach;
 mod store;
@@ -66,7 +67,7 @@ struct Options {
 
 fn options() -> Options {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("causal-mutation") {
+    if args.first().map(String::as_str) == Some("mutamancer") {
         args.remove(0);
     }
     let mut o = Options {
@@ -91,7 +92,7 @@ fn options() -> Options {
 }
 
 /// The package: its manifest directory, target directory, and the tests
-/// it excludes (`[package.metadata.causal-mutation] exclude`).
+/// it excludes (`[package.metadata.mutamancer] exclude`).
 struct Package {
     dir: PathBuf,
     target: PathBuf,
@@ -106,10 +107,10 @@ fn package() -> Package {
     let pkgs = v["packages"].as_array().unwrap();
     let pkg = pkgs.iter().find(|p| Path::new(p["manifest_path"].as_str().unwrap()).parent().unwrap() == cwd).or(pkgs.first()).expect("a package");
     let exclude =
-        pkg["metadata"]["causal-mutation"]["exclude"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        pkg["metadata"]["mutamancer"]["exclude"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     Package {
         dir: Path::new(pkg["manifest_path"].as_str().unwrap()).parent().unwrap().to_path_buf(),
-        target: PathBuf::from(v["target_directory"].as_str().unwrap()).join("causal-mutation"),
+        target: PathBuf::from(v["target_directory"].as_str().unwrap()).join("mutamancer"),
         exclude,
     }
 }
@@ -245,10 +246,10 @@ fn save(store: &store::Store, map: &Map, tree: gix::ObjectId) -> gix::ObjectId {
 fn load(store: &store::Store, context: &str, commit: gix::ObjectId) -> Map {
     let id = store
         .note(context, commit)
-        .unwrap_or_else(|| panic!("commit {commit} has no map in this context: run `cargo causal-mutation init` on a clean checkout of it"));
+        .unwrap_or_else(|| panic!("commit {commit} has no map in this context: run `cargo mutamancer init` on a clean checkout of it"));
     let parts: store::Parts<Meta, MapItem, MapTest> = store.read(id);
     let m = parts.meta;
-    assert_eq!(m.format, FORMAT, "the map of {commit} is of format {}, this tool reads {FORMAT}: run `cargo causal-mutation init` again", m.format);
+    assert_eq!(m.format, FORMAT, "the map of {commit} is of format {}, this tool reads {FORMAT}: run `cargo mutamancer init` again", m.format);
     assert_eq!(m.tree, store.commit_tree(commit).to_string(), "the map bound to {commit} measures another tree");
     assert_eq!(m.context, context, "the map bound to {commit} has another context");
     assert_eq!(m.content, content_hash(&parts.items, &parts.tests), "the map bound to {commit} does not match its content hash");
@@ -281,7 +282,7 @@ fn staged_tree(pkg: &Package) -> gix::ObjectId {
 /// Where the pre-commit check names the map it wrote, for the post-commit
 /// hook to bind: the map's tree and the source tree it measures.
 fn pending(store: &store::Store) -> PathBuf {
-    store.git_dir().join("causal-mutation-pending")
+    store.git_dir().join("mutamancer-pending")
 }
 
 fn main() {
@@ -485,7 +486,7 @@ fn bind(pkg: &Package) {
     let mut words = text.split_whitespace();
     let (map, tree, _) = (words.next().unwrap(), words.next().unwrap(), words.next().unwrap());
     let (head, head_tree) = store.head().expect("the commit just made");
-    assert_eq!(head_tree.to_string(), tree, "the commit's tree is not the one its check measured: run `cargo causal-mutation check` on it");
+    assert_eq!(head_tree.to_string(), tree, "the commit's tree is not the one its check measured: run `cargo mutamancer check` on it");
     let parts: store::Parts<Meta, MapItem, MapTest> = store.read(gix::ObjectId::from_hex(map.as_bytes()).unwrap());
     store.set_note(&parts.meta.context, head, gix::ObjectId::from_hex(map.as_bytes()).unwrap());
 }
@@ -520,7 +521,7 @@ fn look_for_nondeterminism(o: &Options, pkg: &Package, ctx: &str) -> i32 {
 /// check wrote. An existing hook this tool did not write is left as it is,
 /// and the command stops.
 fn install_hook(o: &Options) {
-    const MARK: &str = "# written by cargo causal-mutation install-hook";
+    const MARK: &str = "# written by cargo mutamancer install-hook";
     let mut args = vec!["--toolchain".to_string(), o.toolchain.clone()];
     if !o.cargo_args.is_empty() {
         args.push("--".into());
@@ -531,10 +532,10 @@ fn install_hook(o: &Options) {
         assert!(out.status.success(), "not in a git repository");
         let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
         if let Ok(old) = std::fs::read_to_string(&path) {
-            assert!(old.contains(MARK), "{} exists and is not this tool's: add `cargo causal-mutation {command}` to it yourself", path.display());
+            assert!(old.contains(MARK), "{} exists and is not this tool's: add `cargo mutamancer {command}` to it yourself", path.display());
         }
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("#!/bin/sh\n{MARK}\nexec cargo causal-mutation {command}\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{MARK}\nexec cargo mutamancer {command}\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

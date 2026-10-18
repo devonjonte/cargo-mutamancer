@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// BLAKE3's derive-key context for a function's fingerprint.
-const FINGERPRINT_CONTEXT: &str = "cargo-causal-mutation 2026-10-18 Rust fn token fingerprint v1";
+const FINGERPRINT_CONTEXT: &str = "cargo-mutamancer 2026-10-18 Rust fn token fingerprint v1";
 
 /// One function (a free function, a method, or a trait's default method;
 /// closures inside it are part of it).

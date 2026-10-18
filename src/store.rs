@@ -8,7 +8,7 @@
 //! mutation/CONTEXT`) naming the map's tree; the map records the source
 //! tree it measures, which must be the commit's own: anyone can verify it.
 //! The pre-commit check writes the map of the tree being committed and
-//! names it in `.git/causal-mutation-pending`; the post-commit hook binds it
+//! names it in `.git/mutamancer-pending`; the post-commit hook binds it
 //! to the new commit.
 
 use gix::ObjectId;
@@ -120,7 +120,7 @@ impl Store {
     }
 
     fn notes_ref(context: &str) -> String {
-        format!("refs/notes/causal-mutation/{}", &blake3::hash(context.as_bytes()).to_hex()[..16])
+        format!("refs/notes/mutamancer/{}", &blake3::hash(context.as_bytes()).to_hex()[..16])
     }
 
     /// The map bound to `commit` in `context`, if any.
@@ -149,7 +149,7 @@ impl Store {
         entries.retain(|(n, _, _)| *n != hex);
         entries.push((hex.clone(), EntryKind::Blob, self.blob(format!("{map}\n").as_bytes())));
         let tree = self.tree(entries);
-        let sig = gix::actor::Signature { name: "cargo-causal-mutation".into(), email: "".into(), time: gix::date::Time::now_utc() };
+        let sig = gix::actor::Signature { name: "cargo-mutamancer".into(), email: "".into(), time: gix::date::Time::now_utc() };
         let note = gix::objs::Commit {
             tree,
             parents: previous.into_iter().collect(),
@@ -160,9 +160,7 @@ impl Store {
             extra_headers: Vec::new(),
         };
         let id = self.repo.write_object(&note).expect("writing the notes commit").detach();
-        self.repo
-            .reference(name.as_str(), id, gix::refs::transaction::PreviousValue::Any, "cargo causal-mutation: a map bound")
-            .expect("updating the notes ref");
+        self.repo.reference(name.as_str(), id, gix::refs::transaction::PreviousValue::Any, "cargo mutamancer: a map bound").expect("updating the notes ref");
     }
 }
 

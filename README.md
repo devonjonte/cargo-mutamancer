@@ -1,17 +1,21 @@
-# cargo-causal-mutation
+# cargo-mutamancer
 
-Mutation testing for Rust that checks each commit for exactly what it
-changed, in seconds, and remembers why.
+The Mutamancer summons bugs: one for every mistake your code could
+contain, so you can see which ones your tests would let through. Most
+mutation testing summons them for all your code, which takes a long time.
+The Mutamancer reads your commit and summons only the bugs your commit
+makes possible, in seconds, and tells you, beside its cause, every one
+your tests would let through.
 
 A test suite's strength changes one commit at a time: a commit deletes the
 only test that reached some branch, narrows an assertion, or adds code no
-test exercises. `cargo causal-mutation` checks each commit as it is made,
-and reports each loss beside its cause:
+test exercises. `cargo mutamancer` checks each commit as it is made, and
+reports each loss beside its cause:
 
 ```text
-src/many.rs: hash_four_at_a_time, branch 3 (true side): reached by no test
-  since this commit: it removes many::test::test_hash_blocks_without_plans,
-  the only test that reached it
+lib::many::hash_four_at_a_time: 39 sides reached by no test since this change:
+  it removes lib::many::test::test_hash_blocks_without_plans
+    584:1 code, 585:24 code, 585:25 code, 588:8 code and 35 more
 ```
 
 It keeps, for every test, the branch sides it reaches (the *reach map*),
@@ -33,10 +37,10 @@ It needs a nightly toolchain, which builds the tests with LLVM's branch
 coverage:
 
 ```sh
-cargo install --git https://github.com/johnservil/cargo-causal-mutation
-cargo causal-mutation init                 # the first map: every test, once
-cargo causal-mutation install-hook         # check each commit before it is made
-cargo causal-mutation check                # the same, by hand
+cargo install --git https://github.com/johnservil/cargo-mutamancer
+cargo mutamancer init                 # the first map: every test, once
+cargo mutamancer install-hook         # check each commit before it is made
+cargo mutamancer check                # the same, by hand
 ```
 
 `--toolchain T` names the nightly (`nightly` by default), `-j N` the
@@ -51,7 +55,7 @@ or accepted with `check --accept`.
 keep it exact, and each way it could fail with its answer. In brief:
 
 - **Fingerprints.** Each function is fingerprinted by its tokens (BLAKE3,
-  derive-key mode, context `"cargo-causal-mutation 2026-10-18 Rust fn
+  derive-key mode, context `"cargo-mutamancer 2026-10-18 Rust fn
   token fingerprint v1"`), so layout, comments, and formatting change
   nothing. A commit's work is decided by which fingerprints it changes.
 - **Reach.** Each test runs alone, in its own process, under LLVM's source
@@ -66,11 +70,11 @@ keep it exact, and each way it could fail with its answer. In brief:
   those you list as excluded:
 
   ```toml
-  [package.metadata.causal-mutation]
+  [package.metadata.mutamancer]
   exclude = ["lanes::test::*"]
   ```
 
-  `cargo causal-mutation look-for-nondeterminism` measures every included
+  `cargo mutamancer look-for-nondeterminism` measures every included
   test again and reports each whose reach changed with nothing it depends
   on changed. It can find nondeterminism, never prove its absence.
 - **Every core.** Work runs on `-j` workers (by default one per CPU),
@@ -84,7 +88,7 @@ so the excluded list is empty.
 
 ## License
 
-You may use `cargo-causal-mutation` under the terms of any of these four
+You may use `cargo-mutamancer` under the terms of any of these four
 Free and Open Source Software licences:
 
 * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
