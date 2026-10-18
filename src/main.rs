@@ -4,6 +4,7 @@
 //!     cargo causal-mutation init [OPTIONS] [-- CARGO_TEST_ARGS]
 //!     cargo causal-mutation check [--accept] [OPTIONS] [-- CARGO_TEST_ARGS]
 //!     cargo causal-mutation look-for-nondeterminism [OPTIONS] [-- CARGO_TEST_ARGS]
+//!     cargo causal-mutation install-hook [OPTIONS] [-- CARGO_TEST_ARGS]
 //!
 //! OPTIONS: `-j N` (workers; one per CPU by default), `--toolchain T`
 //! (the nightly that builds with branch coverage; `nightly` by default).
@@ -215,9 +216,10 @@ fn hex(fp: &[u8; 32]) -> String {
 
 fn load(path: &Path) -> Map {
     let text = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("no map at {}: run `cargo causal-mutation init` first", path.display()));
-    let map: Map = serde_json::from_str(&text).expect("a map");
-    assert_eq!(map.format, FORMAT, "{}: a map of format {}, this tool reads {FORMAT}", path.display(), map.format);
-    map
+    // The format first, so a map of another is refused by name.
+    let format = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["format"].as_u64());
+    assert_eq!(format, Some(FORMAT as u64), "{}: a map of format {format:?}, this tool reads {FORMAT}: run `cargo causal-mutation init` again", path.display());
+    serde_json::from_str(&text).expect("a map of this format")
 }
 
 fn save(path: &Path, map: &Map) {
@@ -245,7 +247,8 @@ fn main() {
             std::process::exit(check(&o, &pkg, &map_path(&pkg, &ctx), ctx))
         }
         "look-for-nondeterminism" => std::process::exit(look_for_nondeterminism(&o, &pkg, &map_path(&pkg, &context(&o, &pkg)))),
-        other => panic!("a command this tool knows: init, check, look-for-nondeterminism (not {other:?})"),
+        "install-hook" => install_hook(&o),
+        other => panic!("a command this tool knows: init, check, look-for-nondeterminism, install-hook (not {other:?})"),
     }
 }
 
@@ -426,4 +429,31 @@ fn look_for_nondeterminism(o: &Options, pkg: &Package, path: &Path) -> i32 {
     }
     eprintln!("    {} tests measured again; {differing} differ", measured.len());
     if differing == 0 { 0 } else { 1 }
+}
+
+/// Write the repository's pre-commit hook: `check`, with this command's
+/// options, before each commit. An existing hook this tool did not write is
+/// left as it is, and the command stops.
+fn install_hook(o: &Options) {
+    let out = Command::new("git").args(["rev-parse", "--git-path", "hooks/pre-commit"]).output().expect("running git");
+    assert!(out.status.success(), "not in a git repository");
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    const MARK: &str = "# written by cargo causal-mutation install-hook";
+    if let Ok(old) = std::fs::read_to_string(&path) {
+        assert!(old.contains(MARK), "{} exists and is not this tool's: add `cargo causal-mutation check` to it yourself", path.display());
+    }
+    let mut args = vec!["--toolchain".to_string(), o.toolchain.clone()];
+    if !o.cargo_args.is_empty() {
+        args.push("--".into());
+        args.extend(o.cargo_args.iter().cloned());
+    }
+    let hook = format!("#!/bin/sh\n{MARK}\nexec cargo causal-mutation check {}\n", args.join(" "));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, hook).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    eprintln!("    Wrote {}", path.display());
 }
