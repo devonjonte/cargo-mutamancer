@@ -21,6 +21,15 @@ pub struct Binary {
     pub exe: PathBuf,
 }
 
+/// What a build produced: its test binaries, when it started (no IR file
+/// may be older), and the native archives its package's build scripts
+/// wrote (assembly and C).
+pub struct Built {
+    pub bins: Vec<Binary>,
+    pub started: std::time::SystemTime,
+    pub archives: Vec<PathBuf>,
+}
+
 /// The cargo command the tool builds with: the toolchain and the user's
 /// arguments to `cargo test`.
 pub struct Build {
@@ -31,9 +40,16 @@ pub struct Build {
 }
 
 impl Build {
-    /// Build every test binary with coverage; each binary of the package.
-    pub fn binaries(&self) -> Vec<Binary> {
-        let flags = format!("{} -C instrument-coverage -Z coverage-options=branch", std::env::var("RUSTFLAGS").unwrap_or_default());
+    /// Build every test binary with coverage and its IR (`--emit=llvm-ir`,
+    /// for compiled fingerprints); debug information off, and panic
+    /// locations without file and line (`-Z location-detail=none`), so a
+    /// line moved changes no function's code.
+    pub fn binaries(&self) -> Built {
+        let started = std::time::SystemTime::now();
+        let flags = format!(
+            "{} -C instrument-coverage -Z coverage-options=branch --emit=llvm-ir,link -C debuginfo=0 -Z location-detail=none",
+            std::env::var("RUSTFLAGS").unwrap_or_default()
+        );
         let out = Command::new("cargo")
             .arg(format!("+{}", self.toolchain))
             .args(["test", "--no-run", "--message-format=json-render-diagnostics"])
@@ -49,8 +65,21 @@ impl Build {
             .expect("running cargo");
         assert!(out.status.success(), "cargo test --no-run failed");
         let mut bins = Vec::new();
+        let mut archives = Vec::new();
+        let manifest = self.manifest_dir.canonicalize().unwrap_or(self.manifest_dir.clone());
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            // The package's own build scripts: the archives they wrote.
+            if v["reason"] == "build-script-executed" && v["package_id"].as_str().is_some_and(|id| id.contains(&*manifest.to_string_lossy())) {
+                if let Some(dir) = v["out_dir"].as_str() {
+                    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                        if e.path().extension().is_some_and(|x| x == "a") {
+                            archives.push(e.path());
+                        }
+                    }
+                }
+                continue;
+            }
             if v["reason"] != "compiler-artifact" || v["profile"]["test"] != true || v["executable"].is_null() {
                 continue;
             }
@@ -59,7 +88,8 @@ impl Build {
             let id = if kind == "lib" { "lib".to_string() } else { format!("{kind}:{name}") };
             bins.push(Binary { id, root: PathBuf::from(v["target"]["src_path"].as_str().unwrap()), exe: PathBuf::from(v["executable"].as_str().unwrap()) });
         }
-        bins
+        archives.sort();
+        Built { bins, started, archives }
     }
 }
 
@@ -117,7 +147,11 @@ type At = (usize, usize, u8);
 /// Every binary's coverage map, read once, against the crates' items:
 /// each item's sides, numbered once over every binary's regions (a binary
 /// may hold only some of a crate's records), and each binary's layout.
-pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) -> (BTreeMap<String, Sides>, Vec<Layout>) {
+pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) -> (BTreeMap<String, Sides>, Vec<Layout>, BTreeMap<String, String>) {
+    // Which function symbols belong to which item: each coverage record's
+    // name (PGO's: an internal symbol's prefixed by its file and `;`) and
+    // the item its regions lie in.
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
     let mut by_file: HashMap<PathBuf, Vec<&Item>> = HashMap::new();
     for it in items.values() {
         by_file.entry(it.file.canonicalize().unwrap_or(it.file.clone())).or_default().push(it);
@@ -149,6 +183,10 @@ pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) ->
                 }
             }
             if !list.is_empty() {
+                if let Some(name) = info.prof_names.get(&f.header.name_hash) {
+                    let symbol = name.rsplit(';').next().unwrap_or(name);
+                    owner.insert(symbol.to_string(), list[0].1.clone());
+                }
                 placed.push((f.header.name_hash, f.expressions.clone(), list));
             }
         }
@@ -189,7 +227,7 @@ pub fn layouts(bins: &[Binary], items: &BTreeMap<String, Item>, version: u64) ->
                 .collect(),
         })
         .collect();
-    (sides, layouts)
+    (sides, layouts, owner)
 }
 
 impl Layout {

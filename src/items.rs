@@ -22,9 +22,9 @@ pub struct Item {
     pub lines: (usize, usize),
     pub fingerprint: [u8; 32],
     pub is_test: bool,
-    /// Its tokens in order (doc attributes left out): each one's line and
-    /// column (1-based, as LLVM's coverage counts them) and a short hash,
-    /// for matching a changed function's sides to its earlier version's.
+    /// Its tokens' places in order (doc attributes left out): each one's
+    /// line and column (1-based, as LLVM's coverage counts them), to name a
+    /// side by where it is.
     pub tokens: Vec<Token>,
 }
 
@@ -32,31 +32,84 @@ pub struct Item {
 pub struct Token {
     pub line: usize,
     pub col: usize,
-    pub hash: u32,
 }
 
-/// Every function of the crate whose root file is `root`, by key.
-pub fn crate_items(root: &Path) -> BTreeMap<String, Item> {
+/// BLAKE3's derive-key context for a module's tokens outside functions.
+const OTHERS_CONTEXT: &str = "cargo-mutamancer 2026-10-18 Rust module tokens outside functions v1";
+
+/// A crate's functions, by key, and each module's fingerprint of its tokens
+/// outside functions (constants, types, `use`s, macros, impl and trait
+/// headers, module declarations), by module path: what a function's own
+/// fingerprint does not see, and a change to which needs a build.
+pub struct Crate {
+    pub items: BTreeMap<String, Item>,
+    pub others: BTreeMap<String, String>,
+    /// Every file of the crate's modules.
+    pub files: Vec<PathBuf>,
+}
+
+/// The crate whose root file is `root`.
+pub fn crate_items(root: &Path) -> Crate {
     let mut out = BTreeMap::new();
     let mut seen = BTreeMap::new();
+    let mut others = BTreeMap::new();
     let dir = root.parent().expect("a root file in a directory").to_path_buf();
-    walk_file(root, &dir, &[], &mut out, &mut seen);
-    out
+    let mut files = Vec::new();
+    walk_file(root, &dir, &[], &mut out, &mut seen, &mut others, &mut files);
+    let others = others.into_iter().map(|(k, h): (String, blake3::Hasher)| (k, h.finalize().to_hex().to_string())).collect();
+    Crate { items: out, others, files }
+}
+
+/// Feed `tokens` (outside functions) into the module's fingerprint.
+fn other(others: &mut BTreeMap<String, blake3::Hasher>, path: &[String], tokens: TokenStream) {
+    let h = others.entry(path.join("::")).or_insert_with(|| blake3::Hasher::new_derive_key(OTHERS_CONTEXT));
+    let mut list = Vec::new();
+    walk_tokens(tokens, &mut list);
+    h.update(&(list.len() as u64).to_le_bytes());
+    for (_, bytes) in list {
+        h.update(&bytes);
+    }
 }
 
 /// A module's file: its items, and the files of the modules it declares.
 /// `dir` is where its child modules' files are.
-fn walk_file(file: &Path, dir: &Path, path: &[String], out: &mut BTreeMap<String, Item>, seen: &mut BTreeMap<String, usize>) {
+fn walk_file(
+    file: &Path,
+    dir: &Path,
+    path: &[String],
+    out: &mut BTreeMap<String, Item>,
+    seen: &mut BTreeMap<String, usize>,
+    others: &mut BTreeMap<String, blake3::Hasher>,
+    files: &mut Vec<PathBuf>,
+) {
+    files.push(file.to_path_buf());
     let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
     let ast = syn::parse_file(&text).unwrap_or_else(|e| panic!("parsing {}: {e}", file.display()));
-    walk_items(&ast.items, file, dir, path, out, seen);
+    // The file's inner attributes (`#![...]`) are its module's too.
+    for a in &ast.attrs {
+        other(others, path, a.to_token_stream());
+    }
+    walk_items(&ast.items, file, dir, path, out, seen, others, files);
 }
 
-fn walk_items(items: &[syn::Item], file: &Path, dir: &Path, path: &[String], out: &mut BTreeMap<String, Item>, seen: &mut BTreeMap<String, usize>) {
+#[allow(clippy::too_many_arguments)]
+fn walk_items(
+    items: &[syn::Item],
+    file: &Path,
+    dir: &Path,
+    path: &[String],
+    out: &mut BTreeMap<String, Item>,
+    seen: &mut BTreeMap<String, usize>,
+    others: &mut BTreeMap<String, blake3::Hasher>,
+    files: &mut Vec<PathBuf>,
+) {
     for item in items {
         match item {
             syn::Item::Fn(f) => add(out, seen, path, None, &f.sig.ident.to_string(), &f.attrs, f.to_token_stream(), file),
             syn::Item::Impl(imp) => {
+                let mut header = imp.clone();
+                header.items.retain(|it| !matches!(it, syn::ImplItem::Fn(_)));
+                other(others, path, header.to_token_stream());
                 let ty = type_name(&imp.self_ty);
                 let owner = match &imp.trait_ {
                     Some((_, t, _)) => format!("<impl {} for {ty}>", t.to_token_stream()),
@@ -69,6 +122,13 @@ fn walk_items(items: &[syn::Item], file: &Path, dir: &Path, path: &[String], out
                 }
             }
             syn::Item::Trait(t) => {
+                let mut header = t.clone();
+                for it in &mut header.items {
+                    if let syn::TraitItem::Fn(f) = it {
+                        f.default = None;
+                    }
+                }
+                other(others, path, header.to_token_stream());
                 for it in &t.items {
                     if let syn::TraitItem::Fn(f) = it {
                         if f.default.is_some() {
@@ -78,18 +138,21 @@ fn walk_items(items: &[syn::Item], file: &Path, dir: &Path, path: &[String], out
                 }
             }
             syn::Item::Mod(m) => {
+                let mut header = m.clone();
+                header.content = None;
+                other(others, path, header.to_token_stream());
                 let name = m.ident.to_string();
                 let mut child: Vec<String> = path.to_vec();
                 child.push(name.clone());
                 match &m.content {
-                    Some((_, inner)) => walk_items(inner, file, &dir.join(&name), &child, out, seen),
+                    Some((_, inner)) => walk_items(inner, file, &dir.join(&name), &child, out, seen, others, files),
                     None => {
                         let (child_file, child_dir) = module_file(&m.attrs, file, dir, &name);
-                        walk_file(&child_file, &child_dir, &child, out, seen);
+                        walk_file(&child_file, &child_dir, &child, out, seen, others, files);
                     }
                 }
             }
-            _ => {}
+            other_item => other(others, path, other_item.to_token_stream()),
         }
     }
 }
@@ -158,10 +221,7 @@ fn add(
         for (_, bytes) in &list {
             h.update(bytes);
         }
-        let tokens = list
-            .iter()
-            .map(|(at, bytes)| Token { line: at.line, col: at.column + 1, hash: u32::from_le_bytes(blake3::hash(bytes).as_bytes()[..4].try_into().unwrap()) })
-            .collect();
+        let tokens = list.iter().map(|(at, _)| Token { line: at.line, col: at.column + 1 }).collect();
         Item {
             key,
             file: file.to_path_buf(),
