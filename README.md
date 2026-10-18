@@ -47,6 +47,9 @@ or accepted with `check --accept`.
 
 ## How it works
 
+[DESIGN.md](DESIGN.md) gives the design whole: the promise, the rules that
+keep it exact, and each way it could fail with its answer. In brief:
+
 - **Fingerprints.** Each function is fingerprinted by its tokens (BLAKE3,
   derive-key mode, context `"cargo-causal-mutation 2026-10-18 Rust fn
   token fingerprint v1"`), so layout, comments, and formatting change
