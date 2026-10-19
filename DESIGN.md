@@ -12,6 +12,31 @@ test catches now, is reported, each beside its cause. The mutants are
 cargo-mutants' (which models many kinds of bug, never all); the tests are
 those the user promises are deterministic.
 
+## Promises to every user (Zooko, October 18, 2026)
+
+Each promise names the mechanism that keeps it. Each goes in the README
+once its mechanism is built and tested.
+
+1. **No inscrutable messages.** Every stop says what happened in the
+   user's terms, never the tool's internals. Mechanism: a test per stop
+   message (planned).
+2. **No hanging, no unexplained wait.** Any wait longer than a few seconds
+   is announced with its expected length and shows progress. A test
+   running far past its recorded time is reported at once, and counter
+   budgets give the verdict (Hangs, below). Mechanism: the map records
+   the build's and each test's durations (planned; on October 18 a hung
+   test held a run for 74 minutes without a word).
+3. **Every problem you need to know about comes with a next step** you
+   can take now. Mechanism: the message tests of promise 1.
+4. **A faster cycle than before.** Typically, only the tests a change
+   reaches run, and they run on save (#7). Mechanism: measured on real
+   histories and stated in the README.
+5. **No busy work.** The tool asks only for what improves the codebase's
+   safety and quality: never a hand-kept list of tests, never audit
+   rounds. Mechanism: review against this promise. An exclusion list of
+   46 tests broke it on October 18, which is why nondeterministic routes
+   are to be the tool's job (NEXT-STEPS.md).
+
 ## Three rules
 
 - **Causal.** Each fact is read where it arises (the two trees, git's
@@ -101,6 +126,10 @@ three-way merge guesses where a moved line went: see
 [badmerge](https://tahoe-lafs.org/~zooko/badmerge/simple.html)).
 
 ## Determinism: the user's promise
+
+(Under review: NEXT-STEPS.md proposes that the user promise only that each
+test always passes or always fails, and that the tool handle varying routes
+itself.)
 
 The tests the tool uses are those the user promises are deterministic: all
 but those listed in `[package.metadata.mutamancer] exclude`. Deterministic
