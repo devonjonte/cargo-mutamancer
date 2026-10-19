@@ -109,10 +109,15 @@ measuring tests again with nothing they depend on changed. It can find
 nondeterminism, never prove its absence.
 
 - **Data.** Each test's reads are recorded by a small preload library
-  (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`): files opened for reading and
-  directories listed, inside the repository, each hashed. Reads elsewhere
-  (`/proc`, `/etc`, the network) make a test machine-dependent, and it is
-  reported as nondeterministic unless they are declared.
+  (`LD_PRELOAD`; macOS's `DYLD_INSERT_LIBRARIES` is issue #6): each file
+  it opened for reading or looked for and found absent, and each
+  directory it listed, wherever it lies, but what the test wrote itself.
+  Each is kept by its hash (a file's content, a directory's listing, or
+  absence), and a test runs again when any of them hashes otherwise. The
+  test process's own state (`/proc/self`, `/dev`) is no input the tool
+  can hash; it is part of the determinism the user promises. On BLAKE3, a
+  commit touching documents alone runs no test, and one touching an
+  assembly file runs the tests that read or run it.
 - **Hangs, without clocks.** Rust code, the standard library included
   (built with coverage), advances the coverage counters; a mutant's run
   past a fixed multiple of the unmutated run's counter sum is a hang. A

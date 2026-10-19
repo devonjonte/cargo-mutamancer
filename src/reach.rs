@@ -26,6 +26,8 @@ pub struct Binary {
 pub struct Built {
     pub bins: Vec<Binary>,
     pub archives: Vec<PathBuf>,
+    /// The compiled fingerprints of each of its compilations (compiled.rs).
+    pub fingerprints: Vec<PathBuf>,
 }
 
 /// The cargo command the tool builds with: the toolchain and the user's
@@ -35,23 +37,24 @@ pub struct Build {
     pub cargo_args: Vec<String>,
     pub manifest_dir: PathBuf,
     pub target_dir: PathBuf,
+    /// Where the compiler wrapper writes compiled fingerprints.
+    pub fingerprints: PathBuf,
 }
 
 impl Build {
     /// Build every test binary with coverage, this tool as the compiler
     /// wrapper fingerprinting each function of the package's crates
-    /// (compiled.rs) into `fingerprints`. MIR inlining off (`-Z
+    /// (compiled.rs). MIR inlining off (`-Z
     /// inline-mir=no`), so each function's MIR is its own code; debug
     /// information off, and panic locations without file and line (`-Z
     /// location-detail=none`), so a line moved changes no function's code.
-    pub fn binaries(&self, fingerprints: &Path) -> Built {
+    pub fn binaries(&self) -> Built {
         let flags = format!(
             "{} -C instrument-coverage -Z coverage-options=branch -Z inline-mir=no -C debuginfo=0 -Z location-detail=none",
             std::env::var("RUSTFLAGS").unwrap_or_default()
         );
-        let _ = std::fs::remove_dir_all(fingerprints);
-        std::fs::create_dir_all(fingerprints).expect("the fingerprints' directory");
         let me = std::env::current_exe().expect("this tool's path");
+        std::fs::create_dir_all(&self.fingerprints).expect("the fingerprints' directory");
         let out = Command::new("cargo")
             .arg(format!("+{}", self.toolchain))
             .args(["test", "--no-run", "--message-format=json-render-diagnostics"])
@@ -62,7 +65,7 @@ impl Build {
             .env("LLVM_PROFILE_FILE", self.target_dir.join("build-scripts-%p.profraw"))
             .env("CARGO_TARGET_DIR", &self.target_dir)
             .env("RUSTC_WORKSPACE_WRAPPER", me)
-            .env(crate::compiled::OUT, fingerprints)
+            .env(crate::compiled::OUT, &self.fingerprints)
             .env(crate::compiled::PACKAGE, self.manifest_dir.canonicalize().unwrap_or(self.manifest_dir.clone()))
             .current_dir(&self.manifest_dir)
             .stderr(std::process::Stdio::inherit())
@@ -71,11 +74,21 @@ impl Build {
         assert!(out.status.success(), "cargo test --no-run failed");
         let mut bins = Vec::new();
         let mut archives = Vec::new();
+        let mut fingerprints = Vec::new();
         let manifest = self.manifest_dir.canonicalize().unwrap_or(self.manifest_dir.clone());
+        // A message about the package itself (cargo's package id is
+        // `path+file://DIR#…`), never a path dependency inside its directory.
+        let ours = |v: &serde_json::Value| {
+            v["package_id"]
+                .as_str()
+                .and_then(|id| id.strip_prefix("path+file://"))
+                .and_then(|id| id.split('#').next())
+                .is_some_and(|dir| Path::new(dir) == manifest)
+        };
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
             // The package's own build scripts: the archives they wrote.
-            if v["reason"] == "build-script-executed" && v["package_id"].as_str().is_some_and(|id| id.contains(&*manifest.to_string_lossy())) {
+            if v["reason"] == "build-script-executed" && ours(&v) {
                 if let Some(dir) = v["out_dir"].as_str() {
                     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                         if e.path().extension().is_some_and(|x| x == "a") {
@@ -85,7 +98,16 @@ impl Build {
                 }
                 continue;
             }
-            if v["reason"] != "compiler-artifact" || v["profile"]["test"] != true || v["executable"].is_null() {
+            if v["reason"] != "compiler-artifact" || !ours(&v) {
+                continue;
+            }
+            // Each of the package's compilations (but its build script's):
+            // the fingerprints written beside its artifact.
+            if v["target"]["kind"][0] != "custom-build" {
+                let artifact = PathBuf::from(v["filenames"][0].as_str().expect("an artifact"));
+                fingerprints.push(crate::compiled::path(&self.fingerprints, &artifact));
+            }
+            if v["profile"]["test"] != true || v["executable"].is_null() {
                 continue;
             }
             let kind = v["target"]["kind"][0].as_str().unwrap_or("");
@@ -94,7 +116,9 @@ impl Build {
             bins.push(Binary { id, root: PathBuf::from(v["target"]["src_path"].as_str().unwrap()), exe: PathBuf::from(v["executable"].as_str().unwrap()) });
         }
         archives.sort();
-        Built { bins, archives }
+        fingerprints.sort();
+        fingerprints.dedup();
+        Built { bins, archives, fingerprints }
     }
 }
 
@@ -287,9 +311,10 @@ pub fn profile_version(bin: &Binary, dir: &Path) -> u64 {
 }
 
 /// Run each of `tests` (binary, test name) alone, `jobs` at a time, each
-/// writing its counters under `dir`; the path of each test's profile.
+/// writing its counters under `dir` (and, beside them, what it read: the
+/// `.reads` the preloaded library writes); the path of each test's profile.
 /// A test that fails stops the run: the map needs passing tests.
-pub fn run_tests(tests: &[(Binary, String)], manifest_dir: &Path, dir: &Path, jobs: usize) -> Vec<PathBuf> {
+pub fn run_tests(tests: &[(Binary, String)], manifest_dir: &Path, dir: &Path, jobs: usize, preload: &Path) -> Vec<PathBuf> {
     std::fs::create_dir_all(dir).expect("the profiles' directory");
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
@@ -306,9 +331,13 @@ pub fn run_tests(tests: &[(Binary, String)], manifest_dir: &Path, dir: &Path, jo
                     }
                     let (bin, name) = &tests[i];
                     let _ = std::fs::remove_file(&paths[i]);
+                    let _ = std::fs::remove_file(paths[i].with_extension("reads"));
                     let out = Command::new(&bin.exe)
                         .args(["--exact", name, "--test-threads", "1", "-q"])
                         .env("LLVM_PROFILE_FILE", &paths[i])
+                        // What the test reads, recorded (preload.c).
+                        .env("LD_PRELOAD", preload)
+                        .env("MUTAMANCER_READS", paths[i].with_extension("reads"))
                         .current_dir(manifest_dir)
                         .output()
                         .expect("running a test");

@@ -26,7 +26,7 @@ use std::process::Command;
 use std::time::Instant;
 
 /// The map's format; a map of another is refused, never read.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// The map of one source tree in one context.
 struct Map {
@@ -54,6 +54,9 @@ struct MapItem {
 struct MapTest {
     /// For each item it reached, the indices of the sides it reached.
     reach: BTreeMap<String, Vec<u32>>,
+    /// What it read (files, and directories it listed), each by its hash
+    /// (read_hash): a path in the package relative to it, others absolute.
+    reads: BTreeMap<String, String>,
 }
 
 /// A map's meta, as stored beside its parts.
@@ -225,7 +228,7 @@ struct Measured {
 /// closures; in every crate it was compiled into), with the content of the
 /// native symbols they call.
 fn compiled_fingerprints(
-    dir: &Path,
+    files: &[PathBuf],
     pkg_dir: &Path,
     items: &BTreeMap<String, Item>,
     native: &std::collections::HashMap<String, String>,
@@ -235,8 +238,9 @@ fn compiled_fingerprints(
         by_file.entry(it.file.canonicalize().unwrap_or(it.file.clone())).or_default().push(it);
     }
     let mut parts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for e in std::fs::read_dir(dir).expect("the fingerprints").flatten() {
-        let entries: Vec<compiled::Entry> = serde_json::from_slice(&std::fs::read(e.path()).unwrap()).expect("fingerprints");
+    for f in files {
+        let bytes = std::fs::read(f).unwrap_or_else(|e| panic!("{}: no compiled fingerprints ({e}): was its crate compiled by another wrapper?", f.display()));
+        let entries: Vec<compiled::Entry> = serde_json::from_slice(&bytes).expect("fingerprints");
         for en in entries {
             let file = pkg_dir.join(&en.file);
             let file = file.canonicalize().unwrap_or(file);
@@ -272,13 +276,19 @@ fn compiled_fingerprints(
 /// fingerprints, the included tests.
 fn build(o: &Options, pkg: &Package) -> Measured {
     let t = Instant::now();
-    let b = Build { toolchain: o.toolchain.clone(), cargo_args: o.cargo_args.clone(), manifest_dir: pkg.dir.clone(), target_dir: pkg.target.join("build") };
-    let built = b.binaries(&pkg.target.join("fingerprints"));
+    let b = Build {
+        toolchain: o.toolchain.clone(),
+        cargo_args: o.cargo_args.clone(),
+        manifest_dir: pkg.dir.clone(),
+        target_dir: pkg.target.join("build"),
+        fingerprints: pkg.target.join("fingerprints"),
+    };
+    let built = b.binaries();
     let crates: BTreeMap<String, PathBuf> = built.bins.iter().map(|b| (b.id.clone(), b.root.strip_prefix(&pkg.dir).unwrap_or(&b.root).to_path_buf())).collect();
     let (items, others, _) = all_items(&pkg.dir, &crates);
     let version = reach::profile_version(&built.bins[0], &pkg.target.join("profiles"));
     let (sides, layouts, _) = reach::layouts(&built.bins, &items, version);
-    let compiled = compiled_fingerprints(&pkg.target.join("fingerprints"), &pkg.dir, &items, &native::symbols(&built.archives));
+    let compiled = compiled_fingerprints(&built.fingerprints, &pkg.dir, &items, &native::symbols(&built.archives));
     let mut tests = Vec::new();
     for bin in &built.bins {
         for name in reach::list_tests(bin, &pkg.target) {
@@ -296,12 +306,13 @@ fn build(o: &Options, pkg: &Package) -> Measured {
 fn run(o: &Options, pkg: &Package, m: &Measured, chosen: &BTreeSet<String>) -> BTreeMap<String, MapTest> {
     let t = Instant::now();
     let tests: Vec<(Binary, String)> = m.tests.iter().filter(|(b, n)| chosen.contains(&test_id(b, n))).cloned().collect();
-    let profiles = reach::run_tests(&tests, &pkg.dir, &pkg.target.join("profiles"), o.jobs);
+    let profiles = reach::run_tests(&tests, &pkg.dir, &pkg.target.join("profiles"), o.jobs, &preload(pkg));
     let by_exe: BTreeMap<&Path, &reach::Layout> = m.layouts.iter().map(|(e, l)| (e.as_path(), l)).collect();
     let mut out = BTreeMap::new();
     for ((bin, name), profile) in tests.iter().zip(&profiles) {
         let r = by_exe[bin.exe.as_path()].reached(profile);
-        out.insert(test_id(bin, name), MapTest { reach: r.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect() });
+        let reads = test_reads(pkg, &profile.with_extension("reads"));
+        out.insert(test_id(bin, name), MapTest { reach: r.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect(), reads });
     }
     eprintln!("    Measured {} tests in {:.1?}", tests.len(), t.elapsed());
     out
@@ -353,6 +364,89 @@ fn load(store: &store::Store, context: &str, commit: gix::ObjectId) -> Map {
     assert_eq!(m.context, context, "the map bound to {commit} has another context");
     assert_eq!(m.content, content_hash(&parts.items, &parts.tests), "the map bound to {commit} does not match its content hash");
     Map { context: m.context, crates: m.crates, others: m.others, items: parts.items, tests: parts.tests }
+}
+
+/// What a test read, from the log the preloaded library wrote: each file
+/// and directory it read or looked for, but those it wrote itself and its
+/// process's own state, by hash.
+fn test_reads(pkg: &Package, log: &Path) -> BTreeMap<String, String> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let mut written = BTreeSet::new();
+    let mut read = BTreeSet::new();
+    for line in text.lines() {
+        let Some((kind, path)) = line.split_once(' ') else { continue };
+        // The test process's own state (its /proc, its devices) is no input
+        // the tool can hash: it is the determinism the user promises.
+        if ["/proc/self/", "/proc/thread-self/", "/dev/"].iter().any(|p| path.starts_with(p)) || path == "/proc/self" {
+            continue;
+        }
+        let abs = if Path::new(path).is_absolute() { PathBuf::from(path) } else { pkg.dir.join(path) };
+        let key = match abs.strip_prefix(&pkg.dir) {
+            Ok(rel) => format!("./{}", rel.display()),
+            Err(_) => abs.display().to_string(),
+        };
+        match kind {
+            "w" => {
+                written.insert(key);
+            }
+            "f" | "d" => {
+                if !written.contains(&key) {
+                    read.insert(key);
+                }
+            }
+            _ => {}
+        }
+    }
+    read.into_iter().map(|k| (k.clone(), read_hash(pkg, &k))).collect()
+}
+
+/// A read's immutable identity: a file by its content, a directory by its
+/// listing, an absent path as absent; each under its own derive-key context.
+fn read_hash(pkg: &Package, key: &str) -> String {
+    let path = match key.strip_prefix("./") {
+        Some(rel) => pkg.dir.join(rel),
+        None => PathBuf::from(key),
+    };
+    let tagged = |ctx: &str, parts: &[&[u8]]| {
+        let mut h = blake3::Hasher::new_derive_key(ctx);
+        for p in parts {
+            h.update(&(p.len() as u64).to_le_bytes());
+            h.update(p);
+        }
+        h.finalize().to_hex().to_string()
+    };
+    if path.is_dir() {
+        let mut names: Vec<String> =
+            std::fs::read_dir(&path).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+        names.sort();
+        let parts: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        tagged("cargo-mutamancer 2026-10-18 read directory v1", &parts)
+    } else {
+        match std::fs::read(&path) {
+            Ok(bytes) => tagged("cargo-mutamancer 2026-10-18 read file v1", &[&bytes]),
+            Err(_) => tagged("cargo-mutamancer 2026-10-18 read absent v1", &[]),
+        }
+    }
+}
+
+/// The preloaded library that records what tests read (preload.c), built
+/// once by the system's C compiler into the tool's directory. Linux alone,
+/// for now (`LD_PRELOAD`); macOS needs `DYLD_INSERT_LIBRARIES` with
+/// interposing, not yet written.
+fn preload(pkg: &Package) -> PathBuf {
+    assert!(cfg!(target_os = "linux"), "recording what tests read is written for Linux alone so far (macOS: issue #6)");
+    const SOURCE: &str = include_str!("preload.c");
+    let path = pkg.target.join(format!("preload-{}.so", &blake3::hash(SOURCE.as_bytes()).to_hex()[..16]));
+    if !path.exists() {
+        std::fs::create_dir_all(&pkg.target).unwrap();
+        let src = pkg.target.join("preload.c");
+        std::fs::write(&src, SOURCE).unwrap();
+        let tmp = path.with_extension("so.new");
+        let st = Command::new("cc").args(["-shared", "-fPIC", "-O2", "-o"]).arg(&tmp).arg(&src).arg("-ldl").status().expect("running cc");
+        assert!(st.success(), "building the library that records reads (cc)");
+        std::fs::rename(tmp, &path).unwrap();
+    }
+    path
 }
 
 /// The paths the index changes against `HEAD`.
@@ -478,8 +572,20 @@ fn check(o: &Options, pkg: &Package, ctx: String) -> i32 {
     let removed_tests: BTreeSet<String> = old.tests.keys().filter(|id| !now.get(*id).is_some_and(|it| it.is_test) || excluded(pkg, id)).cloned().collect();
     let paths = changed_paths(pkg);
     let outside: Vec<&PathBuf> = paths.iter().filter(|p| !sources.contains(*p)).collect();
-    let data: Vec<&PathBuf> = outside.iter().copied().filter(|p| !compiled_input(p)).collect();
-    let only_removals = changed.is_empty() && gone.iter().all(|k| removed_tests.contains(k)) && now_others == old.others && outside.is_empty();
+    // Tests whose recorded reads changed: each read hashed again.
+    let mut hashes: BTreeMap<String, String> = BTreeMap::new();
+    let read_changed: BTreeSet<String> = old
+        .tests
+        .iter()
+        .filter(|(id, _)| !removed_tests.contains(*id))
+        .filter(|(_, t)| t.reads.iter().any(|(path, h)| hashes.entry(path.clone()).or_insert_with(|| read_hash(pkg, path)) != h))
+        .map(|(id, _)| id.clone())
+        .collect();
+    // Changed files outside the crates' sources that no test read and that
+    // are no compiled input (documents, say) change nothing.
+    let compiled_outside = outside.iter().any(|p| compiled_input(p));
+    let only_removals =
+        changed.is_empty() && gone.iter().all(|k| removed_tests.contains(k)) && now_others == old.others && !compiled_outside && read_changed.is_empty();
     let mut tests: BTreeMap<String, MapTest> = old.tests.iter().filter(|(id, _)| !removed_tests.contains(*id)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut items = old.items.clone();
     let mut affected = BTreeSet::new();
@@ -491,19 +597,16 @@ fn check(o: &Options, pkg: &Package, ctx: String) -> i32 {
         ran_through = new_items.iter().filter(|(k, v)| old.items.get(*k).is_none_or(|o| o.compiled != v.compiled)).map(|(k, _)| k.clone()).collect();
         ran_through.extend(gone.iter().cloned());
         let included: BTreeSet<String> = m.tests.iter().map(|(b, n)| test_id(b, n)).collect();
-        affected = if data.is_empty() {
-            included
-                .iter()
-                .filter(|id| !old.tests.contains_key(*id) || ran_through.contains(*id) || old.tests[*id].reach.keys().any(|k| ran_through.contains(k)))
-                .cloned()
-                .collect()
-        } else {
-            eprintln!(
-                "    Files outside the crates' code changed ({}): until each test's reads are recorded, every test runs again",
-                few(&data.iter().map(|p| p.display()).collect::<Vec<_>>())
-            );
-            included.clone()
-        };
+        affected = included
+            .iter()
+            .filter(|id| {
+                !old.tests.contains_key(*id)
+                    || ran_through.contains(*id)
+                    || read_changed.contains(*id)
+                    || old.tests[*id].reach.keys().any(|k| ran_through.contains(k))
+            })
+            .cloned()
+            .collect();
         for id in &affected {
             tests.remove(id);
         }

@@ -32,11 +32,24 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::DefId;
 use std::collections::{HashMap, HashSet};
 
-/// The environment variables of the wrapper's protocol: the directory each
-/// compilation writes its fingerprints into, and the package's directory
-/// (only its crates are fingerprinted).
-pub const OUT: &str = "MUTAMANCER_COMPILED_OUT";
+/// The environment variables of the wrapper's protocol: the package's
+/// directory (only its crates are fingerprinted), and the directory each
+/// compilation writes its fingerprints into, named by its artifact's name
+/// (`NAME-HASH`, cargo's `--crate-name` and `extra-filename`), so a build
+/// cargo finds fresh keeps those of the compilation that made it.
 pub const PACKAGE: &str = "MUTAMANCER_PACKAGE_DIR";
+pub const OUT: &str = "MUTAMANCER_COMPILED_OUT";
+
+/// Where the fingerprints of the compilation that made `artifact` (a test
+/// binary, `NAME-HASH`, or a library, `libNAME-HASH.rlib`) are.
+pub fn path(out: &std::path::Path, artifact: &std::path::Path) -> std::path::PathBuf {
+    let name = artifact.file_name().unwrap().to_string_lossy();
+    let name = match name.split_once('.') {
+        Some((stem, _)) => stem.strip_prefix("lib").unwrap_or(stem).to_string(),
+        None => name.to_string(),
+    };
+    out.join(format!("{name}.json"))
+}
 
 /// One function's fingerprint, as the wrapper writes it.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -53,23 +66,24 @@ pub struct Entry {
 /// Whether this process was started as the compiler wrapper: cargo passes
 /// the compiler's path first.
 pub fn is_wrapper() -> bool {
-    std::env::var_os(OUT).is_some() && std::env::args().nth(1).is_some_and(|a| a.ends_with("rustc") || a.contains("/rustc"))
+    std::env::var_os(PACKAGE).is_some() && std::env::args().nth(1).is_some_and(|a| a.ends_with("rustc") || a.contains("/rustc"))
 }
 
 /// The wrapper: compile as rustc would, fingerprinting the package's crates.
 pub fn wrap() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let package = std::env::var(PACKAGE).unwrap_or_default();
-    let cwd = std::env::current_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
-    // A crate of the package: compiled from within its directory.
-    let ours = !package.is_empty() && (cwd == package || cwd.starts_with(&format!("{package}/")));
-    if !ours {
+    let canon = |p: String| std::fs::canonicalize(&p).map(|p| p.to_string_lossy().to_string()).unwrap_or(p);
+    let package = canon(std::env::var(PACKAGE).unwrap());
+    // A crate of the package (cargo names each compilation's package), and
+    // one making an artifact (its info queries make none).
+    let ours = std::env::var("CARGO_MANIFEST_DIR").is_ok_and(|d| canon(d) == package);
+    let arg = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let extra = args.windows(2).find_map(|w| (w[0] == "-C").then(|| w[1].strip_prefix("extra-filename=")).flatten()).unwrap_or("").to_string();
+    let (Some(name), Some(_), true) = (arg("--crate-name"), arg("--out-dir"), ours) else {
         let st = std::process::Command::new(&args[0]).args(&args[1..]).status().expect("running rustc");
         std::process::exit(st.code().unwrap_or(1));
-    }
-    let name = args.windows(2).find(|w| w[0] == "--crate-name").map(|w| w[1].clone()).unwrap_or_default();
-    let id = blake3::hash(args.join("\0").as_bytes()).to_hex()[..16].to_string();
-    let out = std::path::Path::new(&std::env::var(OUT).unwrap()).join(format!("{name}-{id}.json"));
+    };
+    let out = std::path::Path::new(&std::env::var(OUT).unwrap()).join(format!("{name}{extra}.json"));
     let code = rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&args, &mut Fingerprints(out)));
     std::process::exit(if code == std::process::ExitCode::SUCCESS { 0 } else { 1 });
 }
