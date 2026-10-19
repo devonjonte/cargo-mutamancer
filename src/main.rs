@@ -201,10 +201,10 @@ fn test_id(bin: &Binary, name: &str) -> String {
     format!("{}::{name}", bin.id)
 }
 
-/// Whether a test (by id) is one `exclude` names: by libtest's name.
+/// Whether a test is one `exclude` names, by its id as the tool prints it
+/// (`lib::lanes::test::x`, `test:api_plan::y`).
 fn excluded(pkg: &Package, id: &str) -> bool {
-    let name = id.split_once("::").map(|x| x.1).unwrap_or(id);
-    pkg.exclude.iter().any(|p| glob(p, name))
+    pkg.exclude.iter().any(|p| glob(p, id))
 }
 
 fn hex(fp: &[u8; 32]) -> String {
@@ -512,6 +512,7 @@ fn main() {
             // After the build, which writes Cargo.lock where none was.
             let ctx = context(&o, &pkg);
             let map = Map { context: ctx.clone(), crates: m.crates.clone(), others: m.others.clone(), items: map_items(&m), tests };
+            unprotected(&m, &map.tests);
             let id = save(&store, &map, head_tree);
             store.set_note(&ctx, head, id);
             eprintln!("    Bound the map {id} to {head}");
@@ -524,6 +525,20 @@ fn main() {
         "look-for-nondeterminism" => std::process::exit(look_for_nondeterminism(&o, &pkg, &context(&o, &pkg))),
         "install-hook" => install_hook(&o),
         other => panic!("a command this tool knows: init, check, bind, look-for-nondeterminism, install-hook (not {other:?})"),
+    }
+}
+
+/// Report the unprotected code: each function compiled into the build that
+/// no test the tool runs reaches (code only excluded tests reach, and code
+/// no test reaches at all).
+fn unprotected(m: &Measured, tests: &BTreeMap<String, MapTest>) {
+    let reached: BTreeSet<&String> = tests.values().flat_map(|t| t.reach.keys()).collect();
+    let none: Vec<&String> = m.sides.keys().filter(|k| !reached.contains(k) && !m.items.get(*k).is_some_and(|it| it.is_test)).collect();
+    for k in &none {
+        println!("{k}: unprotected, reached by no test the tool runs");
+    }
+    if !none.is_empty() {
+        eprintln!("    {} unprotected: reached by no test the tool runs", plural(none.len(), "function"));
     }
 }
 

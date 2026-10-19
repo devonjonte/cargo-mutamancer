@@ -67,11 +67,11 @@ keep it exact, and each way it could fail with its answer. In brief:
   (toolchain, `Cargo.lock`, flags, target), and the machine's context
   (CPU features, CPU count), and are keyed by all of them. The tests the
   tool uses are the tests you promise are deterministic: all of them, but
-  those you list as excluded:
+  those you list as excluded, by the ids the tool prints (`*` matches any run of characters):
 
   ```toml
   [package.metadata.mutamancer]
-  exclude = ["lanes::test::*"]
+  exclude = ["lib::lanes::test::*", "test:api_plan::*"]
   ```
 
   A test that breaks the promise is yours to fix or exclude, and a check

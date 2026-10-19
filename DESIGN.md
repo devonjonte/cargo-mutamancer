@@ -139,8 +139,9 @@ varies one run in fifty will usually pass both.
   measure is the CPU's count of retired instructions where the system
   gives it (Linux); where it does not (macOS), that case is a stated
   limit.
-- **Unprotected code.** Code only excluded tests reach is reported as
-  unprotected, at `init` and whenever it grows.
+- **Unprotected code.** Each function compiled into the build that no
+  test the tool runs reaches (whether excluded tests reach it or none
+  does) is reported as unprotected at `init`: what the exclusions cost.
 
 ## Running it
 
@@ -174,7 +175,7 @@ failure at once, the ones not yet imagined among them.
 | tests and functions a macro generates | fingerprinted by the macro's invocation; a test the tool cannot place is reported at `init` |
 | matching a changed function to its earlier version | none needed: the explicit list, its entries bound to one version |
 | a test that is not deterministic, unexcluded | the user's breach: `look-for-nondeterminism`, and each finding confirmed by a second run, stop with its name |
-| code only excluded tests reach | reported as unprotected |
+| code no test the tool runs reaches | reported as unprotected at `init` |
 | another machine reaches other code (CPU, OS) | CI on each platform; the hook checks its own machine's paths, as the README says |
 | tests in another crate, doctests, benches | out of scope for now, stated |
 | code cargo-mutants does not mutate (assembly, C, inside macros) | out of scope, stated |
