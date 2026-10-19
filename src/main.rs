@@ -697,10 +697,21 @@ fn look_for_nondeterminism(o: &Options, pkg: &Package, ctx: &str) -> i32 {
     let measured = run(o, pkg, &m, &all);
     let mut differing = 0;
     for (id, t) in &measured {
-        if old.tests.get(id).is_some_and(|m| m != t) {
-            differing += 1;
-            println!("{id}: its reach differs from the map's, with nothing it depends on changed");
+        let Some(was) = old.tests.get(id).filter(|m| *m != t) else { continue };
+        differing += 1;
+        // Where it differs: the functions whose sides it reached otherwise,
+        // and the reads that differ.
+        let keys: BTreeSet<&String> = was.reach.keys().chain(t.reach.keys()).collect();
+        let items: Vec<&String> = keys.into_iter().filter(|k| was.reach.get(*k) != t.reach.get(*k)).collect();
+        let reads: BTreeSet<&String> = was.reads.keys().chain(t.reads.keys()).filter(|k| was.reads.get(*k) != t.reads.get(*k)).collect();
+        let mut what = Vec::new();
+        if !items.is_empty() {
+            what.push(format!("it reaches {} otherwise", few(&items)));
         }
+        if !reads.is_empty() {
+            what.push(format!("it reads {} otherwise", few(&reads.into_iter().collect::<Vec<_>>())));
+        }
+        println!("{id}: with nothing it depends on changed, {}", what.join("; "));
     }
     eprintln!("    {} tests measured again; {differing} differ", measured.len());
     if differing == 0 { 0 } else { 1 }
