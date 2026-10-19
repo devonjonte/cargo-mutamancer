@@ -590,8 +590,9 @@ fn check(o: &Options, pkg: &Package, ctx: String) -> i32 {
     let mut items = old.items.clone();
     let mut affected = BTreeSet::new();
     let mut ran_through: BTreeSet<String> = BTreeSet::new();
+    let mut measured = None;
     if !only_removals {
-        let m = build(o, pkg);
+        let m = measured.insert(build(o, pkg));
         let new_items = map_items(&m);
         // Functions whose compiled code changed, appeared, or vanished.
         ran_through = new_items.iter().filter(|(k, v)| old.items.get(*k).is_none_or(|o| o.compiled != v.compiled)).map(|(k, _)| k.clone()).collect();
@@ -642,6 +643,30 @@ fn check(o: &Options, pkg: &Package, ctx: String) -> i32 {
             continue;
         }
         findings.entry((k.clone(), cause(who))).or_default().push(reach::side_name(&now[k], &old.items[k].sides[*s as usize]));
+    }
+    // Before reporting a lost side, the tests that reached it and ran
+    // again run once more: one that reaches it now is nondeterministic, a
+    // breach of the contract that stops the check (and no finding is
+    // reported falsely).
+    let lost: Vec<(&String, u32, &BTreeSet<String>)> = before
+        .iter()
+        .filter(|((k, s), _)| !(changed.contains(k) || gone.contains(k) || after.contains_key(&(k.clone(), *s))))
+        .map(|((k, s), who)| (k, *s, who))
+        .collect();
+    if let Some(m) = &measured {
+        let again: BTreeSet<String> = lost.iter().flat_map(|(_, _, who)| who.iter()).filter(|t| affected.contains(*t)).cloned().collect();
+        if !again.is_empty() {
+            let rerun = run(o, pkg, m, &again);
+            for (k, s, who) in &lost {
+                for t in who.iter().filter(|t| rerun.get(*t).is_some_and(|r| r.reach.get(*k).is_some_and(|v| v.contains(s)))) {
+                    eprintln!(
+                        "{t} is nondeterministic: run twice on this build, it reached {k} {} once and missed it once. Every test the tool runs must reach the same code each time (the contract); exclude it in [package.metadata.mutamancer] or make it deterministic. `cargo mutamancer look-for-nondeterminism` finds others",
+                        reach::side_name(&now[*k], &old.items[*k].sides[*s as usize])
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
     }
     let count: usize = findings.values().map(Vec::len).sum();
     for ((k, why), sides) in &findings {

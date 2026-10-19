@@ -103,10 +103,23 @@ three-way merge guesses where a moved line went: see
 ## Determinism: the user's promise
 
 The tests the tool uses are those the user promises are deterministic: all
-but those listed in `[package.metadata.mutamancer] exclude`. The tool
-trusts the promise; `look-for-nondeterminism` looks for breaks in it,
-measuring tests again with nothing they depend on changed. It can find
-nondeterminism, never prove its absence.
+but those listed in `[package.metadata.mutamancer] exclude`. Deterministic
+means that on the same build, each run reaches the same code, reads the
+same files, and gets the same result. The promise is part of the user's
+contract: a test that breaks it is the user's to fix or exclude, and what
+its breach costs (a check that missed a weakened test, a false finding) is
+on the user. The tool detects a breach where it can at little cost, and
+stops, naming the test and where it differed:
+
+- `look-for-nondeterminism` measures every test again with nothing it
+  depends on changed;
+- before reporting a lost side, `check` runs once more the tests that
+  reached it and ran again; one that reaches it now has broken the
+  promise. This guards exactly the report a breach would falsify, and
+  costs a deterministic test nothing until a finding.
+
+Repetition can find nondeterminism, never prove its absence: a test that
+varies one run in fifty will usually pass both.
 
 - **Data.** Each test's reads are recorded by a small preload library
   (`LD_PRELOAD`; macOS's `DYLD_INSERT_LIBRARIES` is issue #6): each file
@@ -160,7 +173,7 @@ failure at once, the ones not yet imagined among them.
 | a dependency or toolchain upgrade | the same source measured under both contexts, the difference reported against the upgrade |
 | tests and functions a macro generates | fingerprinted by the macro's invocation; a test the tool cannot place is reported at `init` |
 | matching a changed function to its earlier version | none needed: the explicit list, its entries bound to one version |
-| a test that is not deterministic, unexcluded | `look-for-nondeterminism`; the self-audit |
+| a test that is not deterministic, unexcluded | the user's breach: `look-for-nondeterminism`, and each finding confirmed by a second run, stop with its name |
 | code only excluded tests reach | reported as unprotected |
 | another machine reaches other code (CPU, OS) | CI on each platform; the hook checks its own machine's paths, as the README says |
 | tests in another crate, doctests, benches | out of scope for now, stated |

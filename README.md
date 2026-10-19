@@ -74,9 +74,12 @@ keep it exact, and each way it could fail with its answer. In brief:
   exclude = ["lanes::test::*"]
   ```
 
-  `cargo mutamancer look-for-nondeterminism` measures every included
-  test again and reports each whose reach changed with nothing it depends
-  on changed. It can find nondeterminism, never prove its absence.
+  A test that breaks the promise is yours to fix or exclude, and a check
+  it misleads is on you. The tool stops when it catches one, naming it and
+  where it differed: `cargo mutamancer look-for-nondeterminism` measures
+  every included test again, and `check` runs a test once more before
+  reporting a side it no longer reaches. Repetition can find
+  nondeterminism, never prove its absence.
 - **Every core.** Work runs on `-j` workers (by default one per CPU),
   taking cargo's jobserver tokens when there is one; progress is shown
   as cargo shows it.
