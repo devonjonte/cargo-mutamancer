@@ -92,6 +92,31 @@ Rejected, with reasons:
 - Copying Loom into the tool: Loom works only on code written against its
   types.
 
+## Settled on October 19 (Zooko), to build
+
+The contract: **run on the same code, each test always passes or always
+fails.** Nothing more. A test's route may vary; coping with that is the
+tool's. When a planted bug goes from caught to not caught, the tool
+reruns that one test against that one bug, once (more for a spot it has
+seen vary); a catch on the rerun was luck, a miss again is a finding.
+Causation through shared memory and raw pointers means no static map can
+prove a commit innocent, so the rerun, not reasoning, settles each case.
+The static call map keeps its job: choosing which tests to rerun at all,
+over-counting on purpose.
+
+**Scope idea (Zooko, October 20):** bench-hashes' `check` (Devon, bench
+PR #54) chooses the cells a change can affect by the lines each cell
+executes, which is this tool's rule applied to benchmarks. Once the tool
+is back in hand, consider one tool for both tests and benchmarks: the same
+map of what each measurement reaches, the same rerun rule, one verdict.
+Zooko's square (October 20): the tool **tests the tests** (a planted bug
+each test must catch), and the same mechanism **benchmarks the
+benchmarks** (a planted slowdown each cell must catch: bench-hashes'
+calibration plants, run by hand today) and **benchmarks the tests** (each
+test's cost, and which tests buy their time: a test that catches no bug of
+its own is a candidate to go, as is a cell that no change moves). Devon's
+coming patches to the fork show the last of these in practice.
+
 ## Zooko's promises to users (October 18)
 
 These are recorded in DESIGN.md with each one's mechanism. They go in
