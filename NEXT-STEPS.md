@@ -117,6 +117,17 @@ test's cost, and which tests buy their time: a test that catches no bug of
 its own is a candidate to go, as is a cell that no change moves). Devon's
 coming patches to the fork show the last of these in practice.
 
+**Equivalent operator swaps (Zooko, October 20):** swapping an arithmetic
+operator (`*` for `+`, `%` for `/`) introduces no bug when the operands
+make the two agree in practice (`x * 2` and `x + x`; `a % b` and `a / b`
+with `a < b`, or `b` a power of two for some pairs; `|` and `^` on bits
+that never overlap, as the fork's flag words). The fork's lists carry
+dozens of these with the reason "equivalent", each argued by hand. The
+tool could recognise the common shapes itself (operands it can see are
+equal, constants, or bit-disjoint) and skip the plant, or run the two
+sides on recorded inputs and report "no input told them apart" instead of
+"survived": a survivor that cannot be a bug is noise for the user.
+
 ## Zooko's promises to users (October 18)
 
 These are recorded in DESIGN.md with each one's mechanism. They go in
