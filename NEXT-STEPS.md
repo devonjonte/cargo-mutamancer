@@ -117,6 +117,15 @@ test's cost, and which tests buy their time: a test that catches no bug of
 its own is a candidate to go, as is a cell that no change moves). Devon's
 coming patches to the fork show the last of these in practice.
 
+**Tests under nextest (Zooko, October 20):** the servil projects now run
+every test under cargo-nextest, each in its own process, and the fork's
+mutation check records every test's outcome and time through it. This tool
+runs each test in its own process too, by its own runner (`--exact` per
+test); when work resumes, weigh handing that to nextest (its process per
+test, its time limits that kill and name a hang, its machine-readable
+outcomes) and keeping only what is this tool's own: the map and the rerun
+rule.
+
 **Equivalent operator swaps (Zooko, October 20):** swapping an arithmetic
 operator (`*` for `+`, `%` for `/`) introduces no bug when the operands
 make the two agree in practice (`x * 2` and `x + x`; `a % b` and `a / b`
