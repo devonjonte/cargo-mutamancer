@@ -117,6 +117,33 @@ test's cost, and which tests buy their time: a test that catches no bug of
 its own is a candidate to go, as is a cell that no change moves). Devon's
 coming patches to the fork show the last of these in practice.
 
+**What users see, and the scope (Zooko, October 21):**
+- *Nextest only*, at first: the tool runs tests through cargo-nextest
+  (each in its own process, its time limits, its machine-readable
+  outcomes); support for `cargo test` waits for a user who wants it to
+  send the patch. Narrow scope.
+- *Which test to write next*: the coverage gaps, code no test reaches or
+  whose mutants no test catches, ranked.
+- *Which tests to delete or shrink*: the overlaps, from the cost-weighted
+  cover (each step the test catching the most uncaught mutants per
+  millisecond, so small tests come first; the fork's check.py --map does
+  it today), with the big tests outside it listed, each a reading.
+- *Finish early*: run each mutant's tests in the order most likely to
+  fail first (its known catcher, then the cheapest), stopping at the first
+  failure.
+- *Slowdowns are findings*: a surviving mutant that makes its tests slower
+  is a performance fact about that code; one that makes them faster is an
+  optimization to look at. The record of each test's time on each mutant
+  against its time on the unmutated tree is all it takes.
+- *Skip what cannot be caught here*: mutants in code only another
+  architecture reaches (40% of the fork's AArch64 survivors) cost a build
+  and a test run each and can never be caught on this machine.
+- *Staleness*: a map entry (test T catches mutant M) goes stale when T
+  changes or code on T's path to M changes; per-test line coverage names
+  the tests a commit's changed lines run through, so a hook keeps the map
+  fresh, and a review of a range of commits does the same for any that
+  slipped by.
+
 **Tests under nextest (Zooko, October 20):** the servil projects now run
 every test under cargo-nextest, each in its own process, and the fork's
 mutation check records every test's outcome and time through it. This tool
