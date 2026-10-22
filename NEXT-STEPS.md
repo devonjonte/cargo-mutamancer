@@ -179,6 +179,26 @@ the README once they are true:
 Also: tell the user how long a wait will be, whenever it is longer than a
 few seconds. That applies to us when reporting to Zooko, too.
 
+## First, once BLAKE3 0.8 is released (Zooko, October 21, 2026)
+
+BLAKE3's mutation check (`tools/mutants/check.py`, on cargo-mutants and
+nextest) runs, for every mutant it tries, the whole suite until the first
+failing test, in nextest's own order. Two changes, built here and then
+used there:
+
+- **Each mutant's known catchers first.** The map (`tests.tsv`, keyed by
+  file, change and place) names the tests that caught each mutant; run
+  those first, and the rest only if they now pass. The verdict is the same
+  and a caught mutant stops at once. cargo-mutants cannot give each mutant
+  its own tests, so this needs our own per-mutant runner.
+- **Survivors re-checked only when something they depend on changed.**
+  About 600 survivors, three quarters of a run, each run the whole suite.
+  Per-test coverage says which tests run through a mutant's code; a
+  survivor whose code and whose covering tests are unchanged since the map
+  keeps its verdict (the staleness detection already agreed). The ~240
+  survivors in code for another architecture can be skipped where it is
+  compiled out.
+
 ## Next, in order
 
 1. Fork: fix `Stream::collect()` (the one-CPU hang, below), through the
