@@ -118,6 +118,42 @@ code, is a second record nobody checks.
 mutant. Offer that answer where a person would otherwise write it down:
 `why-keep TEST` printing the mutants only that test catches.
 
+## A survivor's "speed only" is a claim a benchmark can test
+
+**What happened (Zooko's idea, October 26).** About 250 of BLAKE3's x86
+survivors carry reasons like "speed: chooses between equally correct
+paths". Eleven of them, each applied alone and benchmarked over the cells
+that run its changed lines, sorted four ways: one made streams 6-16%
+slower (the path earns its place), five touched code no benchmark runs,
+and the rest read level here but name another machine. One read 8-11%
+faster at 8 pairs and was a trade at 23.
+
+**What it teaches.** "Equally correct" is the test suite's verdict;
+"faster" is the benchmark's. A survivor list holds the first and asserts
+the second without evidence. Code no benchmark reaches can't be claimed
+fast.
+
+**For the Mutamancer.** Beside the kill map, keep a *speed map*: for a
+mutant the tests can't catch, the benchmark verdict per machine (slower,
+level, faster, unmeasured). Report a level one as code to consider
+deleting, and an unmeasured one as a benchmark to write. Judge "faster"
+and "level" only with enough pairs: a first stage misleads.
+
+## Edits to a verdict file go through the tool's own checks
+
+**What happened.** Merging two branches' survivor lists by script, I
+built a line index once and then inserted rows, so later updates landed
+on shifted lines and three mutants got two rows each. The tool's reader
+stopped at the first ("two rows apply on this CPU"), but only when the
+next run started.
+
+**What it teaches.** Hand edits and scripts are where records break. The
+tool's own validation should run on every edit, at once.
+
+**For the Mutamancer.** Offer a `fmt`/`check-lists` command that
+validates a record without running anything (stale names, duplicates,
+missing reasons), cheap enough for a pre-commit hook.
+
 ## Show final verdicts first
 
 **What happened.** BLAKE3's report printed `TIMED OUT (place)` for places
