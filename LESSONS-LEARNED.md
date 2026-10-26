@@ -102,6 +102,22 @@ gap unseen.
 target, a toolchain, a start method), print that as a finding: what it
 couldn't run, and which mutants' verdicts therefore stand unchecked.
 
+## A hand-kept copy of the tool's knowledge goes stale
+
+**What happened.** BLAKE3's tests carried notes such as "Keep: it detects,
+by hanging, mutants the clock then stops (timeouts-x86_64.txt:
+publish_job, take, wake_one)", naming by hand which listed mutants each
+test catches. Several named functions that no longer exist (`Task::run`)
+or mutants never listed (`register`, `waiting`). The notes now point at the
+list, which the check keeps true, and name nothing.
+
+**What it teaches.** A fact the tool can compute, copied by hand into the
+code, is a second record nobody checks.
+
+**For the Mutamancer.** The kill map already says which tests catch each
+mutant. Offer that answer where a person would otherwise write it down:
+`why-keep TEST` printing the mutants only that test catches.
+
 ## Show final verdicts first
 
 **What happened.** BLAKE3's report printed `TIMED OUT (place)` for places
