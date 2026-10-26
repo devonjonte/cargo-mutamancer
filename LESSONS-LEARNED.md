@@ -137,7 +137,10 @@ fast.
 mutant the tests can't catch, the benchmark verdict per machine (slower,
 level, faster, unmeasured). Report a level one as code to consider
 deleting, and an unmeasured one as a benchmark to write. Judge "faster"
-and "level" only with enough pairs: a first stage misleads.
+and "level" only with enough pairs: a first stage misleads. Act on places,
+never on names: a name's list row counts its surviving places, and its
+other places may be caught (one, benchmarked by mistake, made the
+benchmark panic).
 
 ## Edits to a verdict file go through the tool's own checks
 
